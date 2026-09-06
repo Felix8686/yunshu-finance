@@ -399,7 +399,8 @@ export default {
         // 2. AI Parsing. For Telegram, reference_time is the message's own server timestamp,
         // not the later Worker processing time after a reconnect or queue delay.
         const referenceLocalNow = body.reference_time || getLocalNow(env.APP_TIMEZONE || 'Asia/Shanghai');
-        const parsed = await parseIntake(env, body.text, referenceLocalNow);
+        const parsed = (env as unknown as { __mockParsedIntake?: import('./types').ParsedIntake }).__mockParsedIntake
+          || await parseIntake(env, body.text, referenceLocalNow);
 
         // 3. Log Ingestion
         const logId = crypto.randomUUID();
@@ -452,53 +453,107 @@ export default {
         }
 
         if (parsed.intent === 'create_transaction') {
-          const accountId = await resolveAccountId(env, parsed.account_name)
-            || await resolveAccountId(env, '未指定');
-          if (!accountId) throw new Error('ACCOUNT_NOT_CONFIGURED');
+          const txItems = parsed.transactions || [];
+          if (txItems.length === 0) {
+            return jsonResponse({
+              ok: false,
+              error: 'UNRECOGNIZED_INTAKE',
+              message: '未能准确理解您的记账内容，请尝试更清晰的描述。'
+            }, 422);
+          }
 
-          const categoryId = await resolveCategoryId(env, parsed.category_name, parsed.transaction_type)
-            || await resolveCategoryId(env, fallbackCategoryName(parsed.transaction_type), parsed.transaction_type);
-          if (!categoryId) throw new Error('CATEGORY_NOT_CONFIGURED');
+          // Resolve accounts and categories for all transactions before writing
+          const preparedTxs = [];
+          for (let i = 0; i < txItems.length; i++) {
+            const item = txItems[i];
+            const accountId = await resolveAccountId(env, item.account_name)
+              || await resolveAccountId(env, '未指定');
+            if (!accountId) throw new Error('ACCOUNT_NOT_CONFIGURED');
 
-          const amountFen = Math.round(parsed.amount * 100);
-          const txId = crypto.randomUUID();
+            const categoryId = await resolveCategoryId(env, item.category_name, item.transaction_type)
+              || await resolveCategoryId(env, fallbackCategoryName(item.transaction_type), item.transaction_type);
+            if (!categoryId) throw new Error('CATEGORY_NOT_CONFIGURED');
 
-          await env.DB.prepare(`
-            INSERT INTO transactions (
-              id, type, amount_fen, currency, account_id, category_id,
-              merchant, description, raw_text, source, source_id, occurred_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-          `)
-            .bind(
-              txId,
-              parsed.transaction_type,
-              amountFen,
-              parsed.currency,
+            const amountFen = Math.round(item.amount * 100);
+            const txId = crypto.randomUUID();
+            // Source ID idempotent suffix rule: first gets sourceId, subsequent gets `${sourceId}#${i + 1}`
+            const itemSourceId = sourceId ? (i === 0 ? sourceId : `${sourceId}#${i + 1}`) : null;
+
+            preparedTxs.push({
+              id: txId,
+              item,
               accountId,
               categoryId,
-              parsed.merchant || null,
-              parsed.description || parsed.category_name,
+              amountFen,
+              sourceId: itemSourceId
+            });
+          }
+
+          // Atomically insert all transactions in batch
+          const statements = preparedTxs.map((ptx) => {
+            return env.DB.prepare(`
+              INSERT INTO transactions (
+                id, type, amount_fen, currency, account_id, category_id,
+                merchant, description, raw_text, source, source_id, occurred_at, created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            `).bind(
+              ptx.id,
+              ptx.item.transaction_type,
+              ptx.amountFen,
+              ptx.item.currency,
+              ptx.accountId,
+              ptx.categoryId,
+              ptx.item.merchant || null,
+              ptx.item.description || ptx.item.category_name,
               body.text,
               source,
-              sourceId,
-              parsed.occurred_at
-            )
-            .run();
+              ptx.sourceId,
+              ptx.item.occurred_at
+            );
+          });
 
-          const typeLabel = parsed.transaction_type === 'income' ? '收入' : parsed.transaction_type === 'transfer' ? '转账' : '支出';
-          const msg = `已记录${typeLabel} ¥${parsed.amount.toFixed(2)} · ${parsed.category_name} · ${parsed.account_name}`;
+          await env.DB.batch(statements);
+
+          const totalAmount = txItems.reduce((sum: number, it: import('./types').ParsedTransactionItem) => sum + it.amount, 0);
+          const firstTx = preparedTxs[0];
+
+          let replyMsg = '';
+          if (txItems.length === 1) {
+            const single = txItems[0];
+            const typeLabel = single.transaction_type === 'income' ? '收入' : single.transaction_type === 'transfer' ? '转账' : '支出';
+            replyMsg = `已记录${typeLabel} ¥${single.amount.toFixed(2)} · ${single.category_name} · ${single.account_name}`;
+          } else {
+            const lines = txItems.map((it: import('./types').ParsedTransactionItem, idx: number) => {
+              const tLabel = it.transaction_type === 'income' ? ' [收入]' : it.transaction_type === 'transfer' ? ' [转账]' : '';
+              return `${idx + 1}. ${it.category_name}${tLabel} ¥${it.amount.toFixed(2)} · ${it.account_name}`;
+            });
+            replyMsg = `已记录 ${txItems.length} 笔，共 ¥${totalAmount.toFixed(2)}：\n${lines.join('\n')}`;
+          }
+
+          const responseTransactions = preparedTxs.map((ptx) => ({
+            transaction_id: ptx.id,
+            type: ptx.item.transaction_type,
+            amount: ptx.item.amount,
+            category: ptx.item.category_name,
+            account: ptx.item.account_name,
+            merchant: ptx.item.merchant || null,
+            occurred_at: ptx.item.occurred_at
+          }));
 
           return jsonResponse({
             ok: true,
-            message: msg,
+            message: replyMsg,
             data: {
-              transaction_id: txId,
-              type: parsed.transaction_type,
-              amount: parsed.amount,
-              category: parsed.category_name,
-              account: parsed.account_name,
-              merchant: parsed.merchant || null,
-              occurred_at: parsed.occurred_at
+              // Backward compatibility single-item fields
+              transaction_id: firstTx.id,
+              type: firstTx.item.transaction_type,
+              amount: firstTx.item.amount,
+              category: firstTx.item.category_name,
+              account: firstTx.item.account_name,
+              merchant: firstTx.item.merchant || null,
+              occurred_at: firstTx.item.occurred_at,
+              // Full multi-transaction array
+              transactions: responseTransactions
             }
           });
         }

@@ -64,8 +64,7 @@ export interface Env {
 export type IntakeIntent = 'create_transaction' | 'spending_today' | 'unknown';
 export type TransactionType = 'expense' | 'income' | 'transfer';
 
-export interface ParsedIntake {
-  intent: IntakeIntent;
+export interface ParsedTransactionItem {
   transaction_type: TransactionType;
   amount: number;
   currency: string;
@@ -74,7 +73,21 @@ export interface ParsedIntake {
   merchant: string;
   description: string;
   occurred_at: string;
+}
+
+export interface ParsedIntake {
+  intent: IntakeIntent;
   confidence: number;
+  transactions: ParsedTransactionItem[];
+  // Backwards compatibility fields for single transaction callers/views
+  transaction_type?: TransactionType;
+  amount?: number;
+  currency?: string;
+  category_name?: string;
+  account_name?: string;
+  merchant?: string;
+  description?: string;
+  occurred_at?: string;
 }
 
 export interface TelegramPhotoSize {
