@@ -18,6 +18,14 @@ export interface FinanceReferenceCatalog {
   accounts: FinanceAccountReference[];
 }
 
+export function filterAtomicCategories(categories: FinanceCategoryReference[]): FinanceCategoryReference[] {
+  return categories.filter((cat) => !cat.name.includes(',') && !cat.name.includes('，'));
+}
+
+export function isAtomicCategoryName(name: string): boolean {
+  return !name.includes(',') && !name.includes('，');
+}
+
 export async function loadFinanceReferenceCatalog(env: Env): Promise<FinanceReferenceCatalog> {
   const [categories, accounts] = await Promise.all([
     env.DB.prepare(`
@@ -35,9 +43,13 @@ export async function loadFinanceReferenceCatalog(env: Env): Promise<FinanceRefe
     `).all<FinanceAccountReference>()
   ]);
 
+  const candidateCategories = (categories.results || []).filter((item) =>
+    item.name && isAtomicCategoryName(item.name)
+  );
+
   return {
-    categories: categories.results,
-    accounts: accounts.results
+    categories: candidateCategories,
+    accounts: accounts.results || []
   };
 }
 
@@ -72,14 +84,31 @@ export function normalizeParsedReferenceFields(
   parsed: ParsedIntake,
   catalog: FinanceReferenceCatalog
 ): ParsedIntake {
-  const category = exactCategory(catalog, parsed.transaction_type, parsed.category_name)
-    || fallbackCategory(catalog, parsed.transaction_type);
-  const account = exactAccount(catalog, parsed.account_name) || fallbackAccount(catalog);
+  // Normalize each item in transactions array
+  const normalizedTransactions = (parsed.transactions || []).map((tx) => {
+    const category = exactCategory(catalog, tx.transaction_type, tx.category_name)
+      || fallbackCategory(catalog, tx.transaction_type);
+    const account = exactAccount(catalog, tx.account_name) || fallbackAccount(catalog);
+    return {
+      ...tx,
+      category_name: category?.name || tx.category_name,
+      account_name: account?.name || '未指定'
+    };
+  });
+
+  const firstTx = normalizedTransactions[0];
 
   return {
     ...parsed,
-    category_name: category?.name || parsed.category_name,
-    account_name: account?.name || '未指定'
+    transactions: normalizedTransactions,
+    transaction_type: firstTx?.transaction_type ?? parsed.transaction_type ?? 'expense',
+    amount: firstTx?.amount ?? parsed.amount ?? 0,
+    currency: firstTx?.currency ?? parsed.currency ?? 'CNY',
+    category_name: firstTx?.category_name ?? parsed.category_name ?? '其他支出',
+    account_name: firstTx?.account_name ?? parsed.account_name ?? '未指定',
+    merchant: firstTx?.merchant ?? parsed.merchant ?? '',
+    description: firstTx?.description ?? parsed.description ?? '',
+    occurred_at: firstTx?.occurred_at ?? parsed.occurred_at ?? ''
   };
 }
 

@@ -1,0 +1,106 @@
+================================================================================
+HERMES_MULTI_INTAKE_FIX_HANDOFF
+================================================================================
+
+Date: 2026-09-06
+Branch: fix/multi-intake-and-taxonomy-v1
+Base: main (966c7692ca52a8f75ada836a7704406560313175)
+PR Title: fix: split multi-item text intakes and isolate legacy taxonomy
+
+1. 修改背景与目标
+--------------------------------------------------------------------------------
+在 2026-09-06 19:22 线上生产环境中，用户输入：
+“一盒硬白沙烟10元，一提维达抽纸18.9”
+系统回复了合并账单：
+“已记录支出 ¥28.90 · 烟酒, 食 · 未指定”
+
+经排查根因为：
+1) 架构层面：ParsedIntake 为单对象结构，/v1/intake 仅 INSERT 一笔 transaction，无法记录复合多消费。
+2) 数据层面：历史数据恢复时写入了 70 个含逗号的复合分类（如“烟酒, 食”），并作为 active categories 被动态注入 AI 候选池，导致 AI 将两件不同类别商品合并为“烟酒, 食”。
+
+本次修复实现了：
+- 文字记账一条消息自动拆解为多笔独立 transaction（如 10元 烟酒 + 18.9元 日用品），总金额与各分类精确保真。
+- 历史复合分类从新记账候选池彻底隔离（代码层 + migration 双层防护）。
+
+2. 关键代码变更
+--------------------------------------------------------------------------------
+1) src/types.ts:
+   - 新增 ParsedTransactionItem 接口。
+   - ParsedIntake 升级为支持 transactions: ParsedTransactionItem[]。
+   - 保留旧 ParsedIntake 顶层字段以保证 API 消费方兼容。
+
+2) src/ai.ts:
+   - 更新 JSON Schema，让 AI 输出 transactions 数组。
+   - 增强 System Prompt，明确指示一条消息包含多笔独立流水时必须逐笔拆分，禁止拼接待逗号复合分类。
+   - 增加多商品（如硬白沙烟10元 + 维达抽纸18.9）的强示例。
+
+3) src/finance-reference.ts:
+   - 增加 isAtomicCategoryName 与 filterAtomicCategories。
+   - 确保包含 ',' 或 '，' 的复合历史分类被排除出 AI prompt 与 normalize 候选池，严防污染新流水。
+   - 历史查询与 JOIN 依然不受影响。
+
+4) src/index.ts:
+   - /v1/intake 支持批量拆分 transactions 写入。
+   - 采用 D1 batch 原子化执行，任何一笔失败全部 rollback。
+   - source_id 分配规则：第一笔为原始 source_id (如 tg_56)，后续笔依次使用 #2, #3 (如 tg_56#2)。
+   - 兼容幂等性检测：source + 原始 source_id 重复投递时返回 duplicate 且 0 新增。
+   - 单笔与多笔回复文案分别优化（多笔明确说明拆分成 N 笔及明细）。
+
+5) migrations/0006_deactivate_composite_restored_categories.sql:
+   - 将历史导入产生的 70 个含逗号复合分类标记为 is_active = 0。
+   - 仅执行 is_active 变更，不删除分类，不破坏历史 221 笔流水的 category_id 与 JOIN。
+
+3. 测试验证结果
+--------------------------------------------------------------------------------
+- npm run typecheck: PASS (0 错误)
+- npm test: 全部 PASS
+  - tests/receipt-reconciliation.test.ts: PASS
+  - tests/receipt-resolver.test.ts: PASS
+  - tests/finance-query.test.ts: PASS
+  - tests/finance-conversation.test.ts: PASS
+  - tests/intake-fidelity.test.ts: PASS
+  - tests/multi-intake.test.ts: PASS
+    * 覆盖单笔、多笔（烟10 + 抽纸18.9）、3笔（早餐/公交/咖啡）、多同类消费、未指定账户
+    * 覆盖 Telegram event_time 继承
+    * 覆盖 source_id 幂等防重（第二次投递 0 新增）
+    * 覆盖 D1 batch 原子回滚（第二笔失败时第一笔不残留）
+    * 覆盖污染 taxonomy 隔离验证
+- npx wrangler deploy --dry-run: PASS
+- migrations 0001~0006: 隔离本地 D1 执行全部 PASS
+
+4. 真实 Workers AI 隔离验证
+--------------------------------------------------------------------------------
+运行测试：npx tsx tests/real-workers-ai.test.ts
+使用真实 Cloudflare Workers AI 模型 (@cf/meta/llama-3.3-70b-instruct-fp8-fast) 在完全隔离环境下验证输入：
+“一盒硬白沙烟10元，一提维达抽纸18.9”
+
+模型实际返回：
+- intent: create_transaction
+- transactions: 2 笔
+  * 笔 1: amount=10, category=烟酒, description=一盒硬白沙烟, account=未指定
+  * 笔 2: amount=18.9, category=日用品, description=一提维达抽纸, account=未指定
+- 没有任何拼接分类，完全符合预期，隔离验证 PASS。
+
+5. 生产只读核查与待停用复合分类
+--------------------------------------------------------------------------------
+- 生产环境当前含有逗号的分类总数：70 个
+  * 其中 expense 分类（id 均以 restored-cat-expense- 开头）：67 个
+  * 其中 income 分类（id 均以 restored-cat-income- 开头）：3 个（行, 食 / 其他, 数码 / 其他, 娱乐）
+- 本次 migration 0006 覆盖了上述全部 70 个复合分类，执行后将统一设置为 is_active = 0。
+- 本轮未对生产 D1 执行写入或修改，未部署 production Worker。
+
+6. 后续生产部署与 Rollback 指南
+--------------------------------------------------------------------------------
+上线步骤：
+1) 合并 PR fix/multi-intake-and-taxonomy-v1 到 main。
+2) 在生产环境应用 0006 migration：
+   npx wrangler d1 migrations apply wanxiang-cloud-dev --remote
+3) 部署最新 Worker 到生产：
+   npx wrangler deploy
+4) 验证生产 /health 及 Telegram 真实记账体验。
+
+Rollback 注意事项：
+- 如需回滚分类状态：
+  UPDATE categories SET is_active = 1 WHERE id LIKE 'restored-cat-%' AND (name LIKE '%,%' OR name LIKE '%，%');
+- Worker 回滚直接使用 wrangler rollback 或切换回旧 deployment 版本。
+================================================================================
