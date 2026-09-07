@@ -2,19 +2,31 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { parseIntake } from '../src/ai';
-import { Env, ParsedIntake } from '../src/types';
+import { Env } from '../src/types';
+
+function getWranglerAuthToken(): string {
+  const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx';
+  const output = execFileSync(
+    npx,
+    ['wrangler', 'auth', 'token', '--json'],
+    { encoding: 'utf8', maxBuffer: 1024 * 1024 }
+  );
+  const credentials = JSON.parse(output) as {
+    type?: string;
+    token?: string;
+  };
+
+  if (!credentials.token) {
+    throw new Error(`Wrangler auth token unavailable (type=${credentials.type || 'unknown'})`);
+  }
+  return credentials.token;
+}
 
 async function runRealWorkersAITest() {
-  const tomlPath = path.join(
-    process.env.USERPROFILE || 'C:\\Users\\mzer8',
-    'AppData/Roaming/xdg.config/.wrangler/config/default.toml'
-  );
-  const tomlContent = fs.readFileSync(tomlPath, 'utf8');
-  const tokenMatch = tomlContent.match(/oauth_token\s*=\s*"([^"]+)"/);
-  if (!tokenMatch) {
-    throw new Error('OAuth token not found in wrangler config');
-  }
-  const oauthToken = tokenMatch[1];
+  // Do not read oauth_token directly from Wrangler's TOML. That access token may be
+  // expired. `wrangler auth token --json` returns the currently configured token and
+  // refreshes Wrangler OAuth credentials when needed.
+  const authToken = getWranglerAuthToken();
   const accountId = 'ffda4d04feec5de2ef3fb4fbbe35b496';
 
   // Create real Workers AI shim pointing to Cloudflare REST API via curl (avoiding undici proxy issues)
@@ -29,7 +41,7 @@ async function runRealWorkersAITest() {
         '-x', 'http://127.0.0.1:7892',
         '-X', 'POST',
         url,
-        '-H', `Authorization: Bearer ${oauthToken}`,
+        '-H', `Authorization: Bearer ${authToken}`,
         '-H', 'Content-Type: application/json; charset=utf-8',
         '--data-binary', `@${tmpFile}`
       ];
