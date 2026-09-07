@@ -78,6 +78,13 @@ interface TransactionSnapshot {
   items: TransactionItemRow[];
 }
 
+interface TransactionSummaryRow {
+  count: number;
+  expense_fen: number;
+  income_fen: number;
+  transfer_fen: number;
+}
+
 export interface FinanceCommandResult {
   reply: string;
   action: Exclude<CommandAction, 'passthrough'>;
@@ -275,6 +282,7 @@ async function classifyFinanceCommand(
         },
         { role: 'user', content: text }
       ],
+      max_tokens: 1024,
       response_format: { type: 'json_schema', json_schema: schema }
     });
     const response = (result as { response?: unknown })?.response;
@@ -341,7 +349,7 @@ function targetLimit(command: FinanceCommand, probeForAmbiguity: boolean): numbe
   if (command.target.scope === 'latest') return 1;
   if (command.target.count > 0) return command.target.count;
   if (probeForAmbiguity) return 21;
-  if (command.action === 'summarize') return 100;
+  if (command.action === 'query') return 11;
   return 10;
 }
 
@@ -366,6 +374,45 @@ async function resolveTargets(
     LIMIT ?
   `).bind(...binds, targetLimit(command, probeForAmbiguity)).all<TransactionRow>();
   return (result.results || []).map((row) => ({ ...row, amount_fen: Number(row.amount_fen) }));
+}
+
+function summaryLimit(command: FinanceCommand): number | null {
+  if (command.target.scope === 'latest') return 1;
+  if (command.target.count > 0) return command.target.count;
+  if (command.target.scope === 'recent') return 10;
+  return null;
+}
+
+async function summarizeTargets(
+  env: Env,
+  command: FinanceCommand,
+  referenceLocalNow: string
+): Promise<TransactionSummaryRow> {
+  const { clauses, binds } = targetWhere(command, referenceLocalNow);
+  const limit = summaryLimit(command);
+  const result = await env.DB.prepare(`
+    SELECT
+      COUNT(*) AS count,
+      COALESCE(SUM(CASE WHEN type = 'expense' THEN amount_fen ELSE 0 END), 0) AS expense_fen,
+      COALESCE(SUM(CASE WHEN type = 'income' THEN amount_fen ELSE 0 END), 0) AS income_fen,
+      COALESCE(SUM(CASE WHEN type = 'transfer' THEN amount_fen ELSE 0 END), 0) AS transfer_fen
+    FROM (
+      SELECT t.type, t.amount_fen
+      FROM transactions t
+      LEFT JOIN categories c ON c.id = t.category_id
+      LEFT JOIN accounts a ON a.id = t.account_id
+      ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''}
+      ORDER BY t.occurred_at DESC, t.created_at DESC, t.id DESC
+      ${limit == null ? '' : 'LIMIT ?'}
+    ) selected
+  `).bind(...binds, ...(limit == null ? [] : [limit])).first<TransactionSummaryRow>();
+
+  return {
+    count: Number(result?.count || 0),
+    expense_fen: Number(result?.expense_fen || 0),
+    income_fen: Number(result?.income_fen || 0),
+    transfer_fen: Number(result?.transfer_fen || 0)
+  };
 }
 
 async function snapshotTargets(env: Env, rows: TransactionRow[]): Promise<TransactionSnapshot[]> {
@@ -686,26 +733,35 @@ async function executeQuery(
   referenceLocalNow: string,
   summarize: boolean
 ): Promise<FinanceCommandResult> {
-  const rows = await resolveTargets(env, command, referenceLocalNow, false);
   const action = summarize ? 'summarize' : 'query';
-  if (!rows.length) return { action, reply: '没有找到符合条件的账目。' };
 
   if (summarize) {
-    const expense = rows.filter((r) => r.type === 'expense').reduce((s, r) => s + r.amount_fen, 0);
-    const income = rows.filter((r) => r.type === 'income').reduce((s, r) => s + r.amount_fen, 0);
-    const transfer = rows.filter((r) => r.type === 'transfer').reduce((s, r) => s + r.amount_fen, 0);
-    const parts = [`共 ${rows.length} 笔`];
-    if (expense) parts.push(`支出 ¥${(expense / 100).toFixed(2)}`);
-    if (income) parts.push(`收入 ¥${(income / 100).toFixed(2)}`);
-    if (transfer) parts.push(`转账 ¥${(transfer / 100).toFixed(2)}`);
+    const summary = await summarizeTargets(env, command, referenceLocalNow);
+    if (!summary.count) return { action, reply: '没有找到符合条件的账目。' };
+
+    const parts = [`共 ${summary.count} 笔`];
+    if (summary.expense_fen) parts.push(`支出 ¥${(summary.expense_fen / 100).toFixed(2)}`);
+    if (summary.income_fen) parts.push(`收入 ¥${(summary.income_fen / 100).toFixed(2)}`);
+    if (summary.transfer_fen) parts.push(`转账 ¥${(summary.transfer_fen / 100).toFixed(2)}`);
     return { action, reply: parts.join('，') + '。' };
   }
 
+  const rows = await resolveTargets(env, command, referenceLocalNow, false);
+  if (!rows.length) return { action, reply: '没有找到符合条件的账目。' };
+  if (rows.length === 1) return { action, reply: rowLine(rows[0]) };
+
+  const visible = rows.slice(0, 10);
+  const truncated = rows.length > visible.length;
+  const openEnded = command.target.scope !== 'latest' && command.target.count === 0;
+  const header = truncated
+    ? openEnded
+      ? `找到至少 ${rows.length} 笔，先显示前 ${visible.length} 笔：`
+      : `找到 ${rows.length} 笔，先显示前 ${visible.length} 笔：`
+    : `找到 ${rows.length} 笔：`;
+
   return {
     action,
-    reply: rows.length === 1
-      ? rowLine(rows[0])
-      : [`找到 ${rows.length} 笔：`, ...rows.slice(0, 10).map((row, index) => rowLine(row, index))].join('\n')
+    reply: [header, ...visible.map((row, index) => rowLine(row, index))].join('\n')
   };
 }
 
