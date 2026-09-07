@@ -163,7 +163,7 @@ Single control row:
 control_id = primary
 config_epoch
 finance_route_mode = primary_v1 | shadow_v2 | canary_v2 | draining_v2 | primary_v2
-receipt_route_mode = v1 | draining_v1 | v2
+receipt_route_mode = v1 | draining_v1 | v2 | draining_v2
 outbox_mode = paused | enabled | draining
 shadow_mode = off | interpretation_only
 analysis_prose_enabled = 0 | 1
@@ -196,7 +196,6 @@ A ResultSet has one immutable ordered full bounded set plus mutable session wind
 ```text
 result_set_id
 ledger_scope_id
-source_result_id
 plan_id
 plan_version
 session_key
@@ -204,6 +203,7 @@ result_set_version
 row_count
 page_size
 sort_filter_fingerprint
+snapshot_bytes
 created_at
 expires_at
 ```
@@ -219,6 +219,8 @@ entity_fingerprint
 row_snapshot_json
 row_snapshot_bytes
 ```
+
+`FinanceResult -> result_set_id` is the single ownership direction. ResultSet does not point back to FinanceResult.
 
 The session projection owns:
 
