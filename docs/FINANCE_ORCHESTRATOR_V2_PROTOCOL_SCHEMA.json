@@ -1,47 +1,153 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://wanxiang.local/schemas/finance-orchestrator-v2.json",
-  "title": "Wanxiang Finance Orchestrator V2 Protocol Bundle",
+  "$id": "https://wanxiang.local/schemas/finance-orchestrator-v2-rev4.json",
+  "title": "Wanxiang Finance Orchestrator V2 Revision 4 Protocol Bundle",
+  "oneOf": [
+    {"$ref": "#/$defs/FinanceTurn"},
+    {"$ref": "#/$defs/OrchestratorOutput"},
+    {"$ref": "#/$defs/FinancePlan"},
+    {"$ref": "#/$defs/PlanPatch"},
+    {"$ref": "#/$defs/FinanceResult"},
+    {"$ref": "#/$defs/RenderPayload"},
+    {"$ref": "#/$defs/ResultSetSnapshot"},
+    {"$ref": "#/$defs/TurnContextSnapshot"},
+    {"$ref": "#/$defs/FinanceOperationRecord"},
+    {"$ref": "#/$defs/FinanceOutboxRecord"},
+    {"$ref": "#/$defs/ReceiptJob"},
+    {"$ref": "#/$defs/ReceiptProviderAttempt"},
+    {"$ref": "#/$defs/ReceiptArtifact"},
+    {"$ref": "#/$defs/ReceiptEnvelope"},
+    {"$ref": "#/$defs/RuntimeControl"},
+    {"$ref": "#/$defs/PageTokenPayload"}
+  ],
   "$defs": {
+    "IdString": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "Hash64": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
     "FinanceActor": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema_version", "ledger_scope_id", "subject_id", "auth_source"],
+      "required": ["schema_version", "ledger_scope_id", "subject_id", "auth_source", "permissions"],
       "properties": {
-        "schema_version": {"const": 1},
+        "schema_version": {"const": 2},
         "ledger_scope_id": {"const": "personal:primary"},
-        "subject_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "subject_id": {"enum": ["telegram:owner", "api:owner", "system:receipt"]},
         "auth_source": {"enum": ["telegram_owner", "api_owner", "system_receipt"]},
         "permissions": {
           "type": "array",
           "items": {"enum": ["finance:read", "finance:write", "finance:receipt"]},
           "uniqueItems": true,
+          "minItems": 1,
           "maxItems": 3
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"auth_source": {"const": "telegram_owner"}}, "required": ["auth_source"]},
+          "then": {"properties": {"subject_id": {"const": "telegram:owner"}}}
+        },
+        {
+          "if": {"properties": {"auth_source": {"const": "api_owner"}}, "required": ["auth_source"]},
+          "then": {"properties": {"subject_id": {"const": "api:owner"}}}
+        },
+        {
+          "if": {"properties": {"auth_source": {"const": "system_receipt"}}, "required": ["auth_source"]},
+          "then": {"properties": {"subject_id": {"const": "system:receipt"}}}
+        }
+      ]
+    },
+    "OrderingCursor": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "epoch", "update_id"],
+          "properties": {
+            "kind": {"const": "telegram"},
+            "epoch": {"type": "integer", "minimum": 0},
+            "update_id": {"type": "integer", "minimum": 0}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "base_session_version", "request_id"],
+          "properties": {
+            "kind": {"const": "api"},
+            "base_session_version": {"type": "integer", "minimum": 0},
+            "request_id": {"$ref": "#/$defs/IdString"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "source_turn_id", "job_id"],
+          "properties": {
+            "kind": {"const": "receipt_completion"},
+            "source_turn_id": {"$ref": "#/$defs/IdString"},
+            "job_id": {"$ref": "#/$defs/IdString"}
+          }
+        }
+      ]
+    },
+    "AttachmentReference": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "attachment_ref"],
+          "properties": {
+            "kind": {"const": "telegram_photo"},
+            "attachment_ref": {"type": "string", "minLength": 1, "maxLength": 256}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "receipt_artifact_id", "job_id"],
+          "properties": {
+            "kind": {"const": "receipt_artifact"},
+            "receipt_artifact_id": {"$ref": "#/$defs/IdString"},
+            "job_id": {"$ref": "#/$defs/IdString"}
+          }
+        }
+      ]
     },
     "FinanceTurn": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema_version", "turn_id", "channel", "channel_event_id", "actor", "session_key", "ordering_key", "event_time", "received_time", "timezone", "payload_hash", "correlation_id"],
+      "required": [
+        "schema_version", "turn_id", "channel", "channel_event_id", "idempotency_key",
+        "payload_hash", "actor", "session_key", "ordering", "event_time", "received_time",
+        "timezone", "correlation_id", "attachments"
+      ],
       "properties": {
-        "schema_version": {"const": 1},
-        "turn_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "schema_version": {"const": 2},
+        "turn_id": {"$ref": "#/$defs/IdString"},
         "channel": {"enum": ["telegram", "api", "receipt"]},
-        "channel_event_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "channel_event_id": {"$ref": "#/$defs/IdString"},
+        "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 256},
+        "payload_hash": {"$ref": "#/$defs/Hash64"},
         "actor": {"$ref": "#/$defs/FinanceActor"},
         "session_key": {"type": "string", "minLength": 1, "maxLength": 256},
-        "thread_id": {"type": ["string", "null"], "maxLength": 128},
-        "topic_id": {"type": ["string", "null"], "maxLength": 128},
-        "ordering_key": {"type": "integer", "minimum": 0},
+        "ordering": {"$ref": "#/$defs/OrderingCursor"},
         "event_time": {"type": "string", "format": "date-time"},
         "received_time": {"type": "string", "format": "date-time"},
         "timezone": {"const": "Asia/Shanghai"},
         "text": {"type": ["string", "null"], "maxLength": 4000},
-        "attachment_refs": {"type": "array", "items": {"type": "string", "maxLength": 256}, "maxItems": 4},
-        "payload_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
-        "correlation_id": {"type": "string", "minLength": 1, "maxLength": 128},
-        "causation_turn_id": {"type": ["string", "null"], "maxLength": 128},
+        "attachments": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/AttachmentReference"},
+          "maxItems": 4
+        },
+        "correlation_id": {"$ref": "#/$defs/IdString"},
+        "causation_turn_id": {"anyOf": [{"$ref": "#/$defs/IdString"}, {"type": "null"}]},
         "base_session_version": {"type": ["integer", "null"], "minimum": 0}
       }
     },
@@ -57,11 +163,12 @@
     "TemporalScope": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["from", "to", "timezone"],
+      "required": ["from", "to", "timezone", "end_exclusive"],
       "properties": {
         "from": {"type": "string", "format": "date-time"},
         "to": {"type": "string", "format": "date-time"},
         "timezone": {"const": "Asia/Shanghai"},
+        "end_exclusive": {"const": true},
         "source_phrase": {"type": ["string", "null"], "maxLength": 256}
       }
     },
@@ -74,6 +181,18 @@
         "value": {"type": "string", "minLength": 1, "maxLength": 128}
       }
     },
+    "ResultWindow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["result_set_id", "result_set_version", "start_ordinal", "end_ordinal", "page_size"],
+      "properties": {
+        "result_set_id": {"$ref": "#/$defs/IdString"},
+        "result_set_version": {"type": "integer", "minimum": 1},
+        "start_ordinal": {"type": "integer", "minimum": 1, "maximum": 200},
+        "end_ordinal": {"type": "integer", "minimum": 1, "maximum": 200},
+        "page_size": {"type": "integer", "minimum": 1, "maximum": 20}
+      }
+    },
     "ReferenceSpec": {
       "oneOf": [
         {
@@ -82,8 +201,20 @@
           "required": ["kind", "result_set_id", "ordinal"],
           "properties": {
             "kind": {"const": "result_ordinal"},
-            "result_set_id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "result_set_id": {"$ref": "#/$defs/IdString"},
             "ordinal": {"type": "integer", "minimum": 1, "maximum": 200}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "result_set_id", "window_start_ordinal", "window_end_ordinal", "result_set_version"],
+          "properties": {
+            "kind": {"const": "result_window"},
+            "result_set_id": {"$ref": "#/$defs/IdString"},
+            "window_start_ordinal": {"type": "integer", "minimum": 1, "maximum": 200},
+            "window_end_ordinal": {"type": "integer", "minimum": 1, "maximum": 200},
+            "result_set_version": {"type": "integer", "minimum": 1}
           }
         },
         {
@@ -92,7 +223,7 @@
           "required": ["kind", "operation_id"],
           "properties": {
             "kind": {"const": "operation"},
-            "operation_id": {"type": "string", "minLength": 1, "maxLength": 128}
+            "operation_id": {"$ref": "#/$defs/IdString"}
           }
         },
         {
@@ -101,7 +232,7 @@
           "required": ["kind", "receipt_artifact_id"],
           "properties": {
             "kind": {"const": "receipt"},
-            "receipt_artifact_id": {"type": "string", "minLength": 1, "maxLength": 128}
+            "receipt_artifact_id": {"$ref": "#/$defs/IdString"}
           }
         },
         {
@@ -110,7 +241,7 @@
           "required": ["kind", "transaction_id"],
           "properties": {
             "kind": {"const": "transaction"},
-            "transaction_id": {"type": "string", "minLength": 1, "maxLength": 128}
+            "transaction_id": {"$ref": "#/$defs/IdString"}
           }
         },
         {
@@ -119,7 +250,7 @@
           "required": ["kind", "item_id"],
           "properties": {
             "kind": {"const": "transaction_item"},
-            "item_id": {"type": "string", "minLength": 1, "maxLength": 128}
+            "item_id": {"$ref": "#/$defs/IdString"}
           }
         },
         {
@@ -128,29 +259,42 @@
           "required": ["kind", "semantic_key"],
           "properties": {
             "kind": {"const": "session_semantic"},
-            "semantic_key": {"enum": ["last_created", "last_updated", "last_deleted", "last_restored", "last_receipt", "active_result_set", "previous_result_set"]}
+            "semantic_key": {
+              "enum": [
+                "last_created", "last_updated", "last_deleted", "last_restored", "last_receipt",
+                "active_result_set", "previous_result_set", "active_window", "previous_window"
+              ]
+            }
           }
         }
+      ]
+    },
+    "ReceiptItemCategory": {
+      "enum": [
+        "食品", "饮料", "生鲜", "零食", "日用品", "清洁用品", "个护",
+        "医药健康", "母婴", "宠物", "家居", "数码配件", "服饰", "其他"
       ]
     },
     "CreateItem": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "quantity", "line_total_fen", "category"],
+      "required": ["client_item_key", "name", "quantity", "line_total_fen", "category", "confidence"],
       "properties": {
+        "client_item_key": {"type": "string", "minLength": 1, "maxLength": 128},
         "name": {"type": "string", "minLength": 1, "maxLength": 256},
         "quantity": {"type": "number", "exclusiveMinimum": 0, "maximum": 10000},
         "unit_price_fen": {"type": ["integer", "null"], "minimum": 0, "maximum": 100000000000},
         "line_total_fen": {"type": "integer", "minimum": 0, "maximum": 100000000000},
-        "category": {"enum": ["食品", "饮料", "生鲜", "零食", "日用品", "清洁用品", "个护", "医药健康", "母婴", "宠物", "家居", "数码配件", "服饰", "其他"]},
+        "category": {"$ref": "#/$defs/ReceiptItemCategory"},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1}
       }
     },
     "CreateEntry": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "money", "occurred_at"],
+      "required": ["client_entry_key", "type", "money", "occurred_at"],
       "properties": {
+        "client_entry_key": {"type": "string", "minLength": 1, "maxLength": 128},
         "type": {"enum": ["expense", "income", "transfer"]},
         "money": {"$ref": "#/$defs/Money"},
         "occurred_at": {"type": "string", "format": "date-time"},
@@ -175,26 +319,55 @@
       }
     },
     "FinanceSelection": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["mode"],
-      "properties": {
-        "mode": {"enum": ["exactly_one", "exact_count", "all_matching", "reference"]},
-        "count": {"type": ["integer", "null"], "minimum": 1, "maximum": 50},
-        "reference": {"anyOf": [{"$ref": "#/$defs/ReferenceSpec"}, {"type": "null"}]}
-      }
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {"mode": {"const": "exactly_one"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "count"],
+          "properties": {
+            "mode": {"const": "exact_count"},
+            "count": {"type": "integer", "minimum": 1, "maximum": 50}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {"mode": {"const": "all_matching"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "reference"],
+          "properties": {
+            "mode": {"const": "reference"},
+            "reference": {"$ref": "#/$defs/ReferenceSpec"}
+          }
+        }
+      ]
     },
     "FinancePresentation": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "mode": {"enum": ["details", "summary", "analysis", "comparison"]},
-        "fields": {"type": "array", "items": {"enum": ["date", "time", "item", "amount", "category", "account", "merchant", "type"]}, "uniqueItems": true, "maxItems": 8},
+        "fields": {
+          "type": "array",
+          "items": {"enum": ["date", "time", "item", "amount", "category", "account", "merchant", "type"]},
+          "uniqueItems": true,
+          "maxItems": 8
+        },
         "sort_field": {"enum": ["occurred_at", "amount", "item", "category", "account"]},
         "sort_direction": {"enum": ["asc", "desc"]},
         "group_by": {"enum": ["none", "date", "category", "account", "merchant"]},
         "page_size": {"type": "integer", "minimum": 1, "maximum": 20},
-        "page_token": {"type": ["string", "null"], "maxLength": 256},
+        "page_token": {"type": ["string", "null"], "maxLength": 512},
         "compact": {"type": "boolean"}
       }
     },
@@ -202,21 +375,23 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["target"],
+      "minProperties": 2,
       "properties": {
         "target": {"$ref": "#/$defs/ReferenceSpec"},
         "name": {"type": ["string", "null"], "maxLength": 256},
         "quantity": {"type": ["number", "null"], "exclusiveMinimum": 0, "maximum": 10000},
         "unit_price_fen": {"type": ["integer", "null"], "minimum": 0, "maximum": 100000000000},
         "line_total_fen": {"type": ["integer", "null"], "minimum": 0, "maximum": 100000000000},
-        "category": {"type": ["string", "null"], "maxLength": 64}
+        "category": {"anyOf": [{"$ref": "#/$defs/ReceiptItemCategory"}, {"type": "null"}]}
       }
     },
     "FinanceChanges": {
       "type": "object",
       "additionalProperties": false,
+      "minProperties": 1,
       "properties": {
         "amount_fen": {"type": ["integer", "null"], "minimum": 1, "maximum": 100000000000},
-        "currency": {"enum": ["CNY"]},
+        "currency": {"const": "CNY"},
         "occurred_at": {"type": ["string", "null"], "format": "date-time"},
         "account": {"anyOf": [{"$ref": "#/$defs/CatalogReference"}, {"type": "null"}]},
         "category": {"anyOf": [{"$ref": "#/$defs/CatalogReference"}, {"type": "null"}]},
@@ -230,33 +405,52 @@
       "additionalProperties": false,
       "required": ["schema_version", "plan_id", "plan_version", "base_session_version", "source_turn_id", "ledger_scope_id", "operation", "confidence", "presentation", "entries"],
       "properties": {
-        "schema_version": {"const": 1},
-        "plan_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "schema_version": {"const": 2},
+        "plan_id": {"$ref": "#/$defs/IdString"},
         "plan_version": {"type": "integer", "minimum": 1},
         "base_session_version": {"type": "integer", "minimum": 0},
-        "source_turn_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "source_turn_id": {"$ref": "#/$defs/IdString"},
         "ledger_scope_id": {"const": "personal:primary"},
         "operation": {"const": "create"},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "presentation": {"$ref": "#/$defs/FinancePresentation"},
-        "entries": {"type": "array", "items": {"$ref": "#/$defs/CreateEntry"}, "minItems": 1, "maxItems": 50}
+        "entries": {"type": "array", "items": {"$ref": "#/$defs/CreateEntry"}, "minItems": 1, "maxItems": 20}
       }
     },
-    "QueryLikePlan": {
+    "QueryPlan": {
       "type": "object",
       "additionalProperties": false,
       "required": ["schema_version", "plan_id", "plan_version", "base_session_version", "source_turn_id", "ledger_scope_id", "operation", "confidence", "presentation", "filters"],
       "properties": {
-        "schema_version": {"const": 1},
-        "plan_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "schema_version": {"const": 2},
+        "plan_id": {"$ref": "#/$defs/IdString"},
         "plan_version": {"type": "integer", "minimum": 1},
         "base_session_version": {"type": "integer", "minimum": 0},
-        "source_turn_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "source_turn_id": {"$ref": "#/$defs/IdString"},
         "ledger_scope_id": {"const": "personal:primary"},
-        "operation": {"enum": ["query", "summarize"]},
+        "operation": {"const": "query"},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "presentation": {"$ref": "#/$defs/FinancePresentation"},
-        "temporal_scope": {"$ref": "#/$defs/TemporalScope"},
+        "temporal_scope": {"anyOf": [{"$ref": "#/$defs/TemporalScope"}, {"type": "null"}]},
+        "filters": {"$ref": "#/$defs/FinanceFilters"},
+        "reference": {"anyOf": [{"$ref": "#/$defs/ReferenceSpec"}, {"type": "null"}]}
+      }
+    },
+    "SummarizePlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "plan_id", "plan_version", "base_session_version", "source_turn_id", "ledger_scope_id", "operation", "confidence", "presentation", "filters"],
+      "properties": {
+        "schema_version": {"const": 2},
+        "plan_id": {"$ref": "#/$defs/IdString"},
+        "plan_version": {"type": "integer", "minimum": 1},
+        "base_session_version": {"type": "integer", "minimum": 0},
+        "source_turn_id": {"$ref": "#/$defs/IdString"},
+        "ledger_scope_id": {"const": "personal:primary"},
+        "operation": {"const": "summarize"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "presentation": {"$ref": "#/$defs/FinancePresentation"},
+        "temporal_scope": {"anyOf": [{"$ref": "#/$defs/TemporalScope"}, {"type": "null"}]},
         "filters": {"$ref": "#/$defs/FinanceFilters"},
         "reference": {"anyOf": [{"$ref": "#/$defs/ReferenceSpec"}, {"type": "null"}]}
       }
@@ -264,18 +458,18 @@
     "AnalyzePlan": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema_version", "plan_id", "plan_version", "base_session_version", "source_turn_id", "ledger_scope_id", "operation", "confidence", "presentation", "filters", "metric"],
+      "required": ["schema_version", "plan_id", "plan_version", "base_session_version", "source_turn_id", "ledger_scope_id", "operation", "confidence", "presentation", "filters", "metric", "dimension"],
       "properties": {
-        "schema_version": {"const": 1},
-        "plan_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "schema_version": {"const": 2},
+        "plan_id": {"$ref": "#/$defs/IdString"},
         "plan_version": {"type": "integer", "minimum": 1},
         "base_session_version": {"type": "integer", "minimum": 0},
-        "source_turn_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "source_turn_id": {"$ref": "#/$defs/IdString"},
         "ledger_scope_id": {"const": "personal:primary"},
         "operation": {"const": "analyze"},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "presentation": {"$ref": "#/$defs/FinancePresentation"},
-        "temporal_scope": {"$ref": "#/$defs/TemporalScope"},
+        "temporal_scope": {"anyOf": [{"$ref": "#/$defs/TemporalScope"}, {"type": "null"}]},
         "filters": {"$ref": "#/$defs/FinanceFilters"},
         "metric": {"enum": ["expense", "income", "net", "count", "category_share", "account_share", "trend"]},
         "dimension": {"enum": ["none", "date", "category", "account", "merchant"]}
@@ -284,13 +478,13 @@
     "ComparePlan": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema_version", "plan_id", "plan_version", "base_session_version", "source_turn_id", "ledger_scope_id", "operation", "confidence", "presentation", "left_scope", "right_scope", "metric"],
+      "required": ["schema_version", "plan_id", "plan_version", "base_session_version", "source_turn_id", "ledger_scope_id", "operation", "confidence", "presentation", "left_scope", "right_scope", "filters", "metric", "dimension"],
       "properties": {
-        "schema_version": {"const": 1},
-        "plan_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "schema_version": {"const": 2},
+        "plan_id": {"$ref": "#/$defs/IdString"},
         "plan_version": {"type": "integer", "minimum": 1},
         "base_session_version": {"type": "integer", "minimum": 0},
-        "source_turn_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "source_turn_id": {"$ref": "#/$defs/IdString"},
         "ledger_scope_id": {"const": "personal:primary"},
         "operation": {"const": "compare"},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
@@ -302,25 +496,43 @@
         "dimension": {"enum": ["none", "date", "category", "account", "merchant"]}
       }
     },
-    "MutationPlan": {
+    "UpdatePlan": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema_version", "plan_id", "plan_version", "base_session_version", "source_turn_id", "ledger_scope_id", "operation", "confidence", "presentation", "selection"],
+      "required": ["schema_version", "plan_id", "plan_version", "base_session_version", "source_turn_id", "ledger_scope_id", "operation", "confidence", "presentation", "filters", "selection", "changes"],
       "properties": {
-        "schema_version": {"const": 1},
-        "plan_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "schema_version": {"const": 2},
+        "plan_id": {"$ref": "#/$defs/IdString"},
         "plan_version": {"type": "integer", "minimum": 1},
         "base_session_version": {"type": "integer", "minimum": 0},
-        "source_turn_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "source_turn_id": {"$ref": "#/$defs/IdString"},
         "ledger_scope_id": {"const": "personal:primary"},
-        "operation": {"enum": ["update", "delete"]},
+        "operation": {"const": "update"},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "presentation": {"$ref": "#/$defs/FinancePresentation"},
         "temporal_scope": {"anyOf": [{"$ref": "#/$defs/TemporalScope"}, {"type": "null"}]},
         "filters": {"$ref": "#/$defs/FinanceFilters"},
         "selection": {"$ref": "#/$defs/FinanceSelection"},
-        "reference": {"anyOf": [{"$ref": "#/$defs/ReferenceSpec"}, {"type": "null"}]},
-        "changes": {"anyOf": [{"$ref": "#/$defs/FinanceChanges"}, {"type": "null"}]}
+        "changes": {"$ref": "#/$defs/FinanceChanges"}
+      }
+    },
+    "DeletePlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "plan_id", "plan_version", "base_session_version", "source_turn_id", "ledger_scope_id", "operation", "confidence", "presentation", "filters", "selection"],
+      "properties": {
+        "schema_version": {"const": 2},
+        "plan_id": {"$ref": "#/$defs/IdString"},
+        "plan_version": {"type": "integer", "minimum": 1},
+        "base_session_version": {"type": "integer", "minimum": 0},
+        "source_turn_id": {"$ref": "#/$defs/IdString"},
+        "ledger_scope_id": {"const": "personal:primary"},
+        "operation": {"const": "delete"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "presentation": {"$ref": "#/$defs/FinancePresentation"},
+        "temporal_scope": {"anyOf": [{"$ref": "#/$defs/TemporalScope"}, {"type": "null"}]},
+        "filters": {"$ref": "#/$defs/FinanceFilters"},
+        "selection": {"$ref": "#/$defs/FinanceSelection"}
       }
     },
     "RestorePlan": {
@@ -328,11 +540,11 @@
       "additionalProperties": false,
       "required": ["schema_version", "plan_id", "plan_version", "base_session_version", "source_turn_id", "ledger_scope_id", "operation", "confidence", "presentation", "reference"],
       "properties": {
-        "schema_version": {"const": 1},
-        "plan_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "schema_version": {"const": 2},
+        "plan_id": {"$ref": "#/$defs/IdString"},
         "plan_version": {"type": "integer", "minimum": 1},
         "base_session_version": {"type": "integer", "minimum": 0},
-        "source_turn_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "source_turn_id": {"$ref": "#/$defs/IdString"},
         "ledger_scope_id": {"const": "personal:primary"},
         "operation": {"const": "restore"},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
@@ -343,29 +555,77 @@
     "FinancePlan": {
       "oneOf": [
         {"$ref": "#/$defs/CreatePlan"},
-        {"$ref": "#/$defs/QueryLikePlan"},
+        {"$ref": "#/$defs/QueryPlan"},
+        {"$ref": "#/$defs/SummarizePlan"},
         {"$ref": "#/$defs/AnalyzePlan"},
         {"$ref": "#/$defs/ComparePlan"},
-        {"$ref": "#/$defs/MutationPlan"},
+        {"$ref": "#/$defs/UpdatePlan"},
+        {"$ref": "#/$defs/DeletePlan"},
         {"$ref": "#/$defs/RestorePlan"}
       ]
+    },
+    "TemporalPatch": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["op", "value"], "properties": {"op": {"const": "replace"}, "value": {"$ref": "#/$defs/TemporalScope"}}},
+        {"type": "object", "additionalProperties": false, "required": ["op"], "properties": {"op": {"const": "clear"}}}
+      ]
+    },
+    "FiltersPatch": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["op", "value"], "properties": {"op": {"const": "replace"}, "value": {"$ref": "#/$defs/FinanceFilters"}}},
+        {"type": "object", "additionalProperties": false, "required": ["op"], "properties": {"op": {"const": "clear"}}}
+      ]
+    },
+    "SelectionPatch": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["op", "value"], "properties": {"op": {"const": "replace"}, "value": {"$ref": "#/$defs/FinanceSelection"}}},
+        {"type": "object", "additionalProperties": false, "required": ["op"], "properties": {"op": {"const": "clear"}}}
+      ]
+    },
+    "ChangesPatch": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["op", "value"], "properties": {"op": {"const": "replace"}, "value": {"$ref": "#/$defs/FinanceChanges"}}},
+        {"type": "object", "additionalProperties": false, "required": ["op"], "properties": {"op": {"const": "clear"}}}
+      ]
+    },
+    "PresentationPatch": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["op", "value"], "properties": {"op": {"const": "replace"}, "value": {"$ref": "#/$defs/FinancePresentation"}}},
+        {"type": "object", "additionalProperties": false, "required": ["op"], "properties": {"op": {"const": "clear"}}}
+      ]
+    },
+    "ReferencePatch": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["op", "value"], "properties": {"op": {"const": "replace"}, "value": {"$ref": "#/$defs/ReferenceSpec"}}},
+        {"type": "object", "additionalProperties": false, "required": ["op"], "properties": {"op": {"const": "clear"}}}
+      ]
+    },
+    "OperationPatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "value"],
+      "properties": {
+        "op": {"const": "replace"},
+        "value": {"enum": ["query", "summarize", "analyze", "compare", "update", "delete", "restore"]}
+      }
     },
     "PlanPatch": {
       "type": "object",
       "additionalProperties": false,
       "required": ["schema_version", "base_plan_id", "base_plan_version", "base_session_version"],
+      "minProperties": 5,
       "properties": {
-        "schema_version": {"const": 1},
-        "base_plan_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "schema_version": {"const": 2},
+        "base_plan_id": {"$ref": "#/$defs/IdString"},
         "base_plan_version": {"type": "integer", "minimum": 1},
         "base_session_version": {"type": "integer", "minimum": 0},
-        "operation": {"enum": ["query", "summarize", "analyze", "compare", "update", "delete", "restore"]},
-        "temporal_scope": {"anyOf": [{"$ref": "#/$defs/TemporalScope"}, {"type": "null"}]},
-        "filters": {"anyOf": [{"$ref": "#/$defs/FinanceFilters"}, {"type": "null"}]},
-        "selection": {"anyOf": [{"$ref": "#/$defs/FinanceSelection"}, {"type": "null"}]},
-        "changes": {"anyOf": [{"$ref": "#/$defs/FinanceChanges"}, {"type": "null"}]},
-        "presentation": {"anyOf": [{"$ref": "#/$defs/FinancePresentation"}, {"type": "null"}]},
-        "reference": {"anyOf": [{"$ref": "#/$defs/ReferenceSpec"}, {"type": "null"}]}
+        "operation": {"$ref": "#/$defs/OperationPatch"},
+        "temporal_scope": {"$ref": "#/$defs/TemporalPatch"},
+        "filters": {"$ref": "#/$defs/FiltersPatch"},
+        "selection": {"$ref": "#/$defs/SelectionPatch"},
+        "changes": {"$ref": "#/$defs/ChangesPatch"},
+        "presentation": {"$ref": "#/$defs/PresentationPatch"},
+        "reference": {"$ref": "#/$defs/ReferencePatch"}
       }
     },
     "SafeCandidateSummary": {
@@ -393,24 +653,117 @@
       "additionalProperties": false,
       "required": ["code", "safe_message"],
       "properties": {
-        "code": {"enum": ["interpretation_failed", "clarification_required", "unauthorized", "forbidden_scope", "no_match", "ambiguous_target", "expired_reference", "stale_reference", "stale_turn", "ordering_conflict", "cardinality_mismatch", "invalid_money", "invalid_category", "invalid_account", "policy_rejected", "idempotency_conflict", "in_progress", "db_read_failed", "db_commit_failed", "provider_failed", "render_failed", "delivery_pending", "delivery_failed", "delivery_unknown", "result_too_large", "operation_too_large"]},
+        "code": {"enum": [
+          "interpretation_failed", "clarification_required", "unauthorized", "forbidden_scope",
+          "no_match", "ambiguous_target", "expired_reference", "stale_reference", "stale_turn",
+          "ordering_conflict", "cardinality_mismatch", "invalid_money", "invalid_category",
+          "invalid_account", "policy_rejected", "idempotency_conflict", "in_progress", "stale_fence",
+          "db_read_failed", "db_commit_failed", "provider_failed", "render_failed", "delivery_pending",
+          "delivery_failed", "delivery_unknown", "result_too_large", "operation_too_large", "rollout_interrupted"
+        ]},
         "safe_message": {"type": "string", "minLength": 1, "maxLength": 512}
+      }
+    },
+    "FieldConfidence": {
+      "type": "object",
+      "additionalProperties": {"type": "number", "minimum": 0, "maximum": 1},
+      "maxProperties": 64
+    },
+    "OrchestratorOutput": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "schema_version", "plan", "field_confidence"],
+          "properties": {
+            "kind": {"const": "new_plan"},
+            "schema_version": {"const": 2},
+            "plan": {"$ref": "#/$defs/FinancePlan"},
+            "field_confidence": {"$ref": "#/$defs/FieldConfidence"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "schema_version", "patch", "field_confidence"],
+          "properties": {
+            "kind": {"const": "patch_plan"},
+            "schema_version": {"const": 2},
+            "patch": {"$ref": "#/$defs/PlanPatch"},
+            "field_confidence": {"$ref": "#/$defs/FieldConfidence"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "schema_version", "clarification"],
+          "properties": {
+            "kind": {"const": "clarification"},
+            "schema_version": {"const": 2},
+            "clarification": {"$ref": "#/$defs/ClarificationPayload"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "schema_version"],
+          "properties": {
+            "kind": {"const": "non_finance"},
+            "schema_version": {"const": 2}
+          }
+        }
+      ]
+    },
+    "TransactionItemSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "quantity", "unit_price_fen", "line_total_fen", "category"],
+      "properties": {
+        "id": {"$ref": "#/$defs/IdString"},
+        "name": {"type": "string", "minLength": 1, "maxLength": 256},
+        "quantity": {"type": "number", "exclusiveMinimum": 0},
+        "unit_price_fen": {"type": ["integer", "null"], "minimum": 0},
+        "line_total_fen": {"type": "integer", "minimum": 0},
+        "category": {"type": "string", "minLength": 1, "maxLength": 64}
+      }
+    },
+    "TransactionSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "amount_fen", "currency", "occurred_at", "account_id", "category_id", "merchant", "description", "items"],
+      "properties": {
+        "id": {"$ref": "#/$defs/IdString"},
+        "type": {"enum": ["expense", "income", "transfer"]},
+        "amount_fen": {"type": "integer", "minimum": 1},
+        "currency": {"const": "CNY"},
+        "occurred_at": {"type": "string", "format": "date-time"},
+        "account_id": {"type": ["string", "null"], "maxLength": 128},
+        "category_id": {"type": ["string", "null"], "maxLength": 128},
+        "merchant": {"type": ["string", "null"], "maxLength": 256},
+        "description": {"type": ["string", "null"], "maxLength": 512},
+        "items": {"type": "array", "items": {"$ref": "#/$defs/TransactionItemSnapshot"}, "maxItems": 64}
       }
     },
     "FinanceResultRow": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["entity_type", "entity_id", "snapshot"],
+      "required": ["entity_type", "entity_id", "entity_fingerprint", "snapshot"],
       "properties": {
         "entity_type": {"enum": ["transaction", "transaction_item", "receipt_parent", "operation"]},
-        "entity_id": {"type": "string", "minLength": 1, "maxLength": 128},
-        "entity_fingerprint": {"type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"},
-        "snapshot": {"type": "object"}
+        "entity_id": {"$ref": "#/$defs/IdString"},
+        "entity_fingerprint": {"$ref": "#/$defs/Hash64"},
+        "snapshot": {
+          "oneOf": [
+            {"$ref": "#/$defs/TransactionSnapshot"},
+            {"$ref": "#/$defs/TransactionItemSnapshot"}
+          ]
+        }
       }
     },
     "FinanceSummary": {
       "type": "object",
       "additionalProperties": false,
+      "required": ["transaction_count", "expense_fen", "income_fen", "transfer_fen", "net_fen"],
       "properties": {
         "transaction_count": {"type": "integer", "minimum": 0},
         "expense_fen": {"type": "integer", "minimum": 0},
@@ -419,14 +772,24 @@
         "net_fen": {"type": "integer"}
       }
     },
+    "DimensionPoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "value_fen", "count"],
+      "properties": {
+        "key": {"type": "string", "minLength": 1, "maxLength": 128},
+        "value_fen": {"type": "integer"},
+        "count": {"type": "integer", "minimum": 0}
+      }
+    },
     "FinanceAnalysisData": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["metric", "summary"],
+      "required": ["metric", "summary", "dimensions"],
       "properties": {
-        "metric": {"type": "string", "minLength": 1, "maxLength": 64},
+        "metric": {"enum": ["expense", "income", "net", "count", "category_share", "account_share", "trend"]},
         "summary": {"$ref": "#/$defs/FinanceSummary"},
-        "dimensions": {"type": "array", "items": {"type": "object"}, "maxItems": 50}
+        "dimensions": {"type": "array", "items": {"$ref": "#/$defs/DimensionPoint"}, "maxItems": 50}
       }
     },
     "FinanceComparisonData": {
@@ -434,55 +797,285 @@
       "additionalProperties": false,
       "required": ["metric", "left", "right", "delta_fen"],
       "properties": {
-        "metric": {"type": "string", "minLength": 1, "maxLength": 64},
+        "metric": {"enum": ["expense", "income", "net", "count", "category_share", "account_share"]},
         "left": {"$ref": "#/$defs/FinanceSummary"},
         "right": {"$ref": "#/$defs/FinanceSummary"},
         "delta_fen": {"type": "integer"},
         "delta_ratio": {"type": ["number", "null"]}
       }
     },
-    "FinanceResult": {
+    "FinanceSuccessResult": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema_version", "result_id", "turn_id", "operation", "interpretation_status", "policy_status", "execution_status", "commit_status", "replay_status", "delivery_status"],
+      "required": ["schema_version", "kind", "result_id", "turn_id", "operation", "ledger_scope_id", "commit_status", "render_hash"],
       "properties": {
-        "schema_version": {"const": 1},
-        "result_id": {"type": "string", "minLength": 1, "maxLength": 128},
-        "turn_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "schema_version": {"const": 2},
+        "kind": {"const": "success"},
+        "result_id": {"$ref": "#/$defs/IdString"},
+        "turn_id": {"$ref": "#/$defs/IdString"},
         "operation": {"enum": ["create", "query", "summarize", "analyze", "compare", "update", "delete", "restore", "receipt_create"]},
-        "interpretation_status": {"enum": ["accepted", "clarification", "failed", "not_applicable"]},
-        "policy_status": {"enum": ["approved", "rejected", "not_applicable"]},
-        "execution_status": {"enum": ["not_started", "executed", "failed"]},
-        "commit_status": {"enum": ["not_required", "not_committed", "committed", "failed"]},
-        "replay_status": {"enum": ["original", "replayed"]},
-        "delivery_status": {"enum": ["not_required", "pending", "sending", "accepted", "failed_retryable", "failed_terminal", "unknown"]},
-        "transaction_ids": {"type": "array", "items": {"type": "string", "maxLength": 128}, "maxItems": 50},
+        "ledger_scope_id": {"const": "personal:primary"},
+        "commit_status": {"enum": ["not_required", "committed"]},
+        "render_hash": {"$ref": "#/$defs/Hash64"},
+        "transaction_ids": {"type": "array", "items": {"$ref": "#/$defs/IdString"}, "maxItems": 50},
         "result_set_id": {"type": ["string", "null"], "maxLength": 128},
         "rows": {"type": "array", "items": {"$ref": "#/$defs/FinanceResultRow"}, "maxItems": 20},
         "summary": {"anyOf": [{"$ref": "#/$defs/FinanceSummary"}, {"type": "null"}]},
         "analysis_data": {"anyOf": [{"$ref": "#/$defs/FinanceAnalysisData"}, {"type": "null"}]},
-        "comparison_data": {"anyOf": [{"$ref": "#/$defs/FinanceComparisonData"}, {"type": "null"}]},
-        "clarification": {"anyOf": [{"$ref": "#/$defs/ClarificationPayload"}, {"type": "null"}]},
-        "error": {"anyOf": [{"$ref": "#/$defs/FinanceError"}, {"type": "null"}]}
+        "comparison_data": {"anyOf": [{"$ref": "#/$defs/FinanceComparisonData"}, {"type": "null"}]}
+      }
+    },
+    "FinanceClarificationResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "kind", "result_id", "turn_id", "operation", "ledger_scope_id", "commit_status", "clarification", "render_hash"],
+      "properties": {
+        "schema_version": {"const": 2},
+        "kind": {"const": "clarification"},
+        "result_id": {"$ref": "#/$defs/IdString"},
+        "turn_id": {"$ref": "#/$defs/IdString"},
+        "operation": {"enum": ["create", "query", "summarize", "analyze", "compare", "update", "delete", "restore", "receipt_create"]},
+        "ledger_scope_id": {"const": "personal:primary"},
+        "commit_status": {"const": "not_required"},
+        "clarification": {"$ref": "#/$defs/ClarificationPayload"},
+        "render_hash": {"$ref": "#/$defs/Hash64"}
+      }
+    },
+    "FinanceRejectedResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "kind", "result_id", "turn_id", "operation", "ledger_scope_id", "commit_status", "error", "render_hash"],
+      "properties": {
+        "schema_version": {"const": 2},
+        "kind": {"const": "rejected"},
+        "result_id": {"$ref": "#/$defs/IdString"},
+        "turn_id": {"$ref": "#/$defs/IdString"},
+        "operation": {"enum": ["create", "query", "summarize", "analyze", "compare", "update", "delete", "restore", "receipt_create"]},
+        "ledger_scope_id": {"const": "personal:primary"},
+        "commit_status": {"const": "not_committed"},
+        "error": {"$ref": "#/$defs/FinanceError"},
+        "render_hash": {"$ref": "#/$defs/Hash64"}
+      }
+    },
+    "FinanceErrorResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "kind", "result_id", "turn_id", "operation", "ledger_scope_id", "commit_status", "error", "render_hash"],
+      "properties": {
+        "schema_version": {"const": 2},
+        "kind": {"const": "error"},
+        "result_id": {"$ref": "#/$defs/IdString"},
+        "turn_id": {"$ref": "#/$defs/IdString"},
+        "operation": {"enum": ["create", "query", "summarize", "analyze", "compare", "update", "delete", "restore", "receipt_create"]},
+        "ledger_scope_id": {"const": "personal:primary"},
+        "commit_status": {"enum": ["not_required", "not_committed"]},
+        "error": {"$ref": "#/$defs/FinanceError"},
+        "render_hash": {"$ref": "#/$defs/Hash64"}
+      }
+    },
+    "FinanceResult": {
+      "oneOf": [
+        {"$ref": "#/$defs/FinanceSuccessResult"},
+        {"$ref": "#/$defs/FinanceClarificationResult"},
+        {"$ref": "#/$defs/FinanceRejectedResult"},
+        {"$ref": "#/$defs/FinanceErrorResult"}
+      ]
+    },
+    "TelegramRenderPart": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["part_index", "text", "part_hash"],
+      "properties": {
+        "part_index": {"type": "integer", "minimum": 0, "maximum": 15},
+        "text": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "part_hash": {"$ref": "#/$defs/Hash64"}
+      }
+    },
+    "RenderPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "telegram_parts"],
+      "properties": {
+        "schema_version": {"const": 2},
+        "telegram_parts": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/TelegramRenderPart"},
+          "maxItems": 16
+        }
+      }
+    },
+    "ResultSetItemSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ordinal", "entity_type", "entity_id", "entity_fingerprint", "row_snapshot_json", "row_snapshot_bytes"],
+      "properties": {
+        "ordinal": {"type": "integer", "minimum": 1, "maximum": 200},
+        "entity_type": {"enum": ["transaction", "transaction_item", "receipt_parent"]},
+        "entity_id": {"$ref": "#/$defs/IdString"},
+        "entity_fingerprint": {"$ref": "#/$defs/Hash64"},
+        "row_snapshot_json": {"type": "string", "minLength": 2, "maxLength": 8192},
+        "row_snapshot_bytes": {"type": "integer", "minimum": 2, "maximum": 8192}
+      }
+    },
+    "ResultSetSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "result_set_id", "ledger_scope_id", "session_key", "result_set_version", "row_count", "page_size", "sort_filter_fingerprint", "snapshot_bytes", "items", "created_at", "expires_at"],
+      "properties": {
+        "schema_version": {"const": 2},
+        "result_set_id": {"$ref": "#/$defs/IdString"},
+        "ledger_scope_id": {"const": "personal:primary"},
+        "session_key": {"type": "string", "minLength": 1, "maxLength": 256},
+        "result_set_version": {"type": "integer", "minimum": 1},
+        "row_count": {"type": "integer", "minimum": 0, "maximum": 200},
+        "page_size": {"type": "integer", "minimum": 1, "maximum": 20},
+        "sort_filter_fingerprint": {"$ref": "#/$defs/Hash64"},
+        "snapshot_bytes": {"type": "integer", "minimum": 0, "maximum": 262144},
+        "items": {"type": "array", "items": {"$ref": "#/$defs/ResultSetItemSnapshot"}, "maxItems": 200},
+        "created_at": {"type": "string", "format": "date-time"},
+        "expires_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "PageTokenPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "ledger_scope_id", "session_key", "result_set_id", "result_set_version", "next_start_ordinal", "page_size", "expires_at"],
+      "properties": {
+        "schema_version": {"const": 2},
+        "ledger_scope_id": {"const": "personal:primary"},
+        "session_key": {"type": "string", "minLength": 1, "maxLength": 256},
+        "result_set_id": {"$ref": "#/$defs/IdString"},
+        "result_set_version": {"type": "integer", "minimum": 1},
+        "next_start_ordinal": {"type": "integer", "minimum": 1, "maximum": 201},
+        "page_size": {"type": "integer", "minimum": 1, "maximum": 20},
+        "expires_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "TurnContextSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "snapshot_id", "turn_id", "ledger_scope_id", "session_key", "base_session_version", "captured_at", "active_plan", "active_result_set_id", "active_window", "previous_window", "recent_turn_summaries", "catalog_hash", "snapshot_hash"],
+      "properties": {
+        "schema_version": {"const": 2},
+        "snapshot_id": {"$ref": "#/$defs/IdString"},
+        "turn_id": {"$ref": "#/$defs/IdString"},
+        "ledger_scope_id": {"const": "personal:primary"},
+        "session_key": {"type": "string", "minLength": 1, "maxLength": 256},
+        "base_session_version": {"type": "integer", "minimum": 0},
+        "captured_at": {"type": "string", "format": "date-time"},
+        "active_plan": {"anyOf": [{"$ref": "#/$defs/FinancePlan"}, {"type": "null"}]},
+        "active_result_set_id": {"type": ["string", "null"], "maxLength": 128},
+        "active_window": {"anyOf": [{"$ref": "#/$defs/ResultWindow"}, {"type": "null"}]},
+        "previous_window": {"anyOf": [{"$ref": "#/$defs/ResultWindow"}, {"type": "null"}]},
+        "recent_turn_summaries": {"type": "array", "items": {"type": "string", "maxLength": 512}, "maxItems": 12},
+        "catalog_hash": {"$ref": "#/$defs/Hash64"},
+        "snapshot_hash": {"$ref": "#/$defs/Hash64"}
+      }
+    },
+    "FinanceOperationRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "operation_id", "ledger_scope_id", "idempotency_key", "payload_hash", "turn_id", "session_key", "operation_type", "status", "lease_epoch", "attempt_count", "route_epoch"],
+      "properties": {
+        "schema_version": {"const": 2},
+        "operation_id": {"$ref": "#/$defs/IdString"},
+        "ledger_scope_id": {"const": "personal:primary"},
+        "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 256},
+        "payload_hash": {"$ref": "#/$defs/Hash64"},
+        "turn_id": {"$ref": "#/$defs/IdString"},
+        "session_key": {"type": "string", "minLength": 1, "maxLength": 256},
+        "operation_type": {"enum": ["create", "update", "delete", "restore", "receipt_create"]},
+        "status": {"enum": ["reserved", "executing", "committed", "rejected", "failed_terminal"]},
+        "lease_owner": {"type": ["string", "null"], "maxLength": 128},
+        "lease_epoch": {"type": "integer", "minimum": 0},
+        "lease_expires_at": {"type": ["string", "null"], "format": "date-time"},
+        "attempt_count": {"type": "integer", "minimum": 0, "maximum": 3},
+        "route_epoch": {"type": "integer", "minimum": 1},
+        "result_id": {"type": ["string", "null"], "maxLength": 128},
+        "error_code": {"type": ["string", "null"], "maxLength": 64}
+      }
+    },
+    "FinanceOutboxRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "outbox_id", "ledger_scope_id", "result_id", "part_index", "render_hash", "destination_type", "destination_id", "status", "lease_epoch", "attempt_count"],
+      "properties": {
+        "schema_version": {"const": 2},
+        "outbox_id": {"$ref": "#/$defs/IdString"},
+        "ledger_scope_id": {"const": "personal:primary"},
+        "result_id": {"$ref": "#/$defs/IdString"},
+        "part_index": {"type": "integer", "minimum": 0, "maximum": 15},
+        "render_hash": {"$ref": "#/$defs/Hash64"},
+        "destination_type": {"const": "telegram_owner"},
+        "destination_id": {"const": "configured_owner_chat"},
+        "thread_id": {"type": ["string", "null"], "maxLength": 128},
+        "status": {"enum": ["pending", "sending", "accepted", "failed_retryable", "failed_terminal", "unknown"]},
+        "lease_owner": {"type": ["string", "null"], "maxLength": 128},
+        "lease_epoch": {"type": "integer", "minimum": 0},
+        "lease_expires_at": {"type": ["string", "null"], "format": "date-time"},
+        "attempt_count": {"type": "integer", "minimum": 0, "maximum": 5},
+        "next_attempt_at": {"type": ["string", "null"], "format": "date-time"},
+        "telegram_message_id": {"type": ["integer", "null"], "minimum": 1}
+      }
+    },
+    "ReceiptJob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "job_id", "ledger_scope_id", "turn_id", "source_event_id", "attachment_ref", "status", "lease_epoch", "attempt_count", "route_epoch"],
+      "properties": {
+        "schema_version": {"const": 2},
+        "job_id": {"$ref": "#/$defs/IdString"},
+        "ledger_scope_id": {"const": "personal:primary"},
+        "turn_id": {"$ref": "#/$defs/IdString"},
+        "source_event_id": {"$ref": "#/$defs/IdString"},
+        "attachment_ref": {"type": "string", "minLength": 1, "maxLength": 256},
+        "caption": {"type": ["string", "null"], "maxLength": 4000},
+        "status": {"enum": ["queued", "processing", "artifact_ready", "committed", "rejected", "failed_terminal"]},
+        "lease_owner": {"type": ["string", "null"], "maxLength": 128},
+        "lease_epoch": {"type": "integer", "minimum": 0},
+        "lease_expires_at": {"type": ["string", "null"], "format": "date-time"},
+        "attempt_count": {"type": "integer", "minimum": 0, "maximum": 3},
+        "route_epoch": {"type": "integer", "minimum": 1},
+        "receipt_artifact_id": {"type": ["string", "null"], "maxLength": 128}
+      }
+    },
+    "ReceiptProviderAttempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "provider_attempt_id", "job_id", "provider", "job_lease_epoch", "status", "attempt_number", "started_at"],
+      "properties": {
+        "schema_version": {"const": 2},
+        "provider_attempt_id": {"$ref": "#/$defs/IdString"},
+        "job_id": {"$ref": "#/$defs/IdString"},
+        "provider": {"enum": ["veryfi", "workers_ai_classifier"]},
+        "job_lease_epoch": {"type": "integer", "minimum": 0},
+        "status": {"enum": ["started", "succeeded", "failed", "unknown"]},
+        "attempt_number": {"type": "integer", "minimum": 1, "maximum": 3},
+        "started_at": {"type": "string", "format": "date-time"},
+        "finished_at": {"type": ["string", "null"], "format": "date-time"},
+        "error_code": {"type": ["string", "null"], "maxLength": 64}
       }
     },
     "ReceiptResolvedItem": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "quantity", "line_total_fen", "category", "confidence"],
+      "required": ["item_key", "name", "quantity", "line_total_fen", "mapped_category", "category_mapping_version", "confidence"],
       "properties": {
+        "item_key": {"type": "string", "minLength": 1, "maxLength": 128},
         "name": {"type": "string", "minLength": 1, "maxLength": 256},
         "quantity": {"type": "number", "exclusiveMinimum": 0, "maximum": 10000},
         "unit_price_fen": {"type": ["integer", "null"], "minimum": 0},
         "line_total_fen": {"type": "integer", "minimum": 0},
-        "category": {"type": "string", "minLength": 1, "maxLength": 64},
+        "raw_category_label": {"type": ["string", "null"], "maxLength": 64},
+        "mapped_category": {"$ref": "#/$defs/ReceiptItemCategory"},
+        "category_mapping_version": {"const": "receipt-item-v1"},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1}
       }
     },
     "ReceiptReconciliation": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["status", "items_total_fen", "receipt_total_fen", "delta_fen"],
+      "required": ["status", "items_total_fen", "receipt_total_fen", "delta_fen", "tolerance_fen"],
       "properties": {
         "status": {"enum": ["matched", "within_rounding_tolerance", "mismatch", "incomplete"]},
         "items_total_fen": {"type": "integer", "minimum": 0},
@@ -494,16 +1087,16 @@
     "ReceiptArtifact": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema_version", "receipt_artifact_id", "job_id", "turn_id", "source_event_id", "attachment_ref", "provider", "provider_attempt_id", "total_fen", "currency", "items", "reconciliation", "validated_at", "artifact_hash"],
+      "required": ["schema_version", "receipt_artifact_id", "job_id", "turn_id", "source_event_id", "attachment_ref", "provider_attempt_id", "job_lease_epoch", "merchant", "total_fen", "currency", "items", "reconciliation", "validated_at", "artifact_hash"],
       "properties": {
-        "schema_version": {"const": 1},
-        "receipt_artifact_id": {"type": "string", "minLength": 1, "maxLength": 128},
-        "job_id": {"type": "string", "minLength": 1, "maxLength": 128},
-        "turn_id": {"type": "string", "minLength": 1, "maxLength": 128},
-        "source_event_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "schema_version": {"const": 2},
+        "receipt_artifact_id": {"$ref": "#/$defs/IdString"},
+        "job_id": {"$ref": "#/$defs/IdString"},
+        "turn_id": {"$ref": "#/$defs/IdString"},
+        "source_event_id": {"$ref": "#/$defs/IdString"},
         "attachment_ref": {"type": "string", "minLength": 1, "maxLength": 256},
-        "provider": {"type": "string", "minLength": 1, "maxLength": 64},
-        "provider_attempt_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "provider_attempt_id": {"$ref": "#/$defs/IdString"},
+        "job_lease_epoch": {"type": "integer", "minimum": 0},
         "merchant": {"type": ["string", "null"], "maxLength": 256},
         "total_fen": {"type": "integer", "minimum": 1},
         "currency": {"const": "CNY"},
@@ -512,7 +1105,34 @@
         "items": {"type": "array", "items": {"$ref": "#/$defs/ReceiptResolvedItem"}, "maxItems": 64},
         "reconciliation": {"$ref": "#/$defs/ReceiptReconciliation"},
         "validated_at": {"type": "string", "format": "date-time"},
-        "artifact_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+        "artifact_hash": {"$ref": "#/$defs/Hash64"}
+      }
+    },
+    "ReceiptEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "job", "artifact", "source_turn", "context_snapshot"],
+      "properties": {
+        "schema_version": {"const": 2},
+        "job": {"$ref": "#/$defs/ReceiptJob"},
+        "artifact": {"$ref": "#/$defs/ReceiptArtifact"},
+        "source_turn": {"$ref": "#/$defs/FinanceTurn"},
+        "context_snapshot": {"$ref": "#/$defs/TurnContextSnapshot"}
+      }
+    },
+    "RuntimeControl": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "control_id", "config_epoch", "finance_route_mode", "receipt_route_mode", "outbox_mode", "shadow_mode", "analysis_prose_enabled"],
+      "properties": {
+        "schema_version": {"const": 2},
+        "control_id": {"const": "primary"},
+        "config_epoch": {"type": "integer", "minimum": 1},
+        "finance_route_mode": {"enum": ["primary_v1", "shadow_v2", "canary_v2", "draining_v2", "primary_v2"]},
+        "receipt_route_mode": {"enum": ["v1", "draining_v1", "v2", "draining_v2"]},
+        "outbox_mode": {"enum": ["paused", "enabled", "draining"]},
+        "shadow_mode": {"enum": ["off", "interpretation_only"]},
+        "analysis_prose_enabled": {"type": "boolean"}
       }
     }
   }
