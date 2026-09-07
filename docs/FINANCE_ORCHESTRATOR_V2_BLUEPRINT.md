@@ -1,92 +1,423 @@
 # Finance Orchestrator V2 Blueprint
 
-Status: architecture blueprint only. No production code change in this branch yet.
+Status: **architecture-only, revision 2 after architecture audit. No product-code implementation is authorized by this document.**
 
-## 0. Non-negotiable architecture rule
+Baseline at architecture freeze:
 
-The system must follow one rule everywhere:
+- repository: `Felix8686/wanxiang-cloud`
+- production `main`: `b707ddb8a5c627ceb0677c1677e9c4b59005fe19`
+- architecture branch: `refactor/finance-orchestrator-v2-blueprint`
+- audit result that triggered this revision: `NEEDS_REVISION`
 
-**The model is the only natural-language understanding layer. Code is the only fact, execution, persistence, safety, and audit layer.**
-
-This means:
-
-- The model owns intent understanding, contextual interpretation, ellipsis, pronouns, natural date language, user preferences, and conversation continuity.
-- Code owns database reads/writes, exact arithmetic, ID resolution, ambiguity checks, authorization, idempotency, atomicity, ordering, pagination boundaries, audit, and rollback.
-- Regex/keyword parsers may exist only as optional deterministic fast paths or input sanitation. They must never create a second semantic authority or a parallel fallback intent system.
-- A mutation may never fall through from one AI interpretation layer into another AI interpretation layer after failure.
-
-Any future change that creates another parallel intent parser must be treated as an architecture regression unless this document is explicitly revised first.
+This revision replaces the original V2 logical sketch with explicit protocol, state, idempotency, result-set, receipt, outbox, migration, cutover, rollback, observability, and acceptance contracts.
 
 ---
 
-## 1. Why V2 is required
+## 0. Non-negotiable architecture rule
 
-The current production system has several independent finance language paths:
+The system has one permanent division of responsibility:
 
-1. Finance Command Layer
-2. Finance Conversation Layer
-3. deterministic `parseFinanceTextQuery`
-4. legacy intake parsing / handler fallbacks
+**LLM = the only authority for understanding user natural language.  
+Code = the only authority for facts, database state, authorization, execution, persistence, safety, exact calculation, idempotency, ordering, audit, and delivery state.**
 
-This has produced a class of failures where each component understands part of the user's language, but no component owns the full conversation state.
+Consequences:
 
-Observed example:
+1. User-language intent, ellipsis, pronouns, natural dates, topic continuation, presentation preferences, and clarification are interpreted only by the Finance Dialogue Orchestrator.
+2. Regex/keyword logic may only perform:
+   - transport/input sanitation;
+   - schema/format validation;
+   - deterministic normalization of already structured fields;
+   - non-semantic protocol checks.
+3. Regex/keyword logic must not decide:
+   - finance operation;
+   - time-range meaning from user prose;
+   - target/reference meaning;
+   - whether a follow-up inherits a prior query;
+   - presentation intent;
+   - destructive-action authorization.
+4. There is no automatic second NLP parser after the orchestrator.
+5. A mutation interpretation failure is fail-closed.
+6. No adapter, renderer, receipt provider, legacy helper, or analysis prose generator may directly mutate the ledger.
+7. The model may describe what the user means; it may never claim a DB fact or mutation result without code execution.
+8. Any future proposal that introduces a second natural-language semantic authority is an architecture regression and requires an explicit blueprint revision before implementation.
 
-- Turn 1: `把上周六到今天的财务支出给我详细列出来`
-- Turn 2: `要求带日期，支出项`
+The receipt extraction pipeline is a narrow exception only in this sense: OCR/receipt field extraction and bounded item-taxonomy classification may use specialized models/providers, but those components do **not** interpret user finance intent and do **not** decide ledger side effects.
 
-Turn 1 can be answered, but the semantic state required by turn 2 is not represented as a single persistent task. The second turn therefore loses the active query context.
+---
 
-The problem is architectural, not a lack of model capability.
+## 1. Current route inventory and why V2 is required
+
+The current production system has multiple finance language authorities and multiple write paths.
+
+### 1.1 Telegram text
+
+Current effective route:
+
+```text
+Telegram message.text
+  -> src/app.ts
+      -> Finance Command AI
+      -> if null/passthrough: Finance Conversation AI / regex gates
+      -> if still unresolved: parseFinanceTextQuery
+      -> if still unresolved: src/index.ts legacy webhook
+           -> /v1/intake
+           -> parseIntake AI
+```
+
+Problems:
+
+- one user turn may be interpreted by more than one semantic system;
+- command success does not establish the same durable conversation state used by conversation/query paths;
+- classification failure can fall through to another model;
+- mutation and read paths have different context and audit semantics;
+- model-call count is not a stable contract.
+
+### 1.2 Natural-language `/v1/intake`
+
+Current route:
+
+```text
+POST /v1/intake
+  -> deterministic parseFinanceTextQuery for some reads
+  -> otherwise legacy parseIntake AI for create/spending_today/unknown
+```
+
+Problems:
+
+- API and Telegram can interpret the same words differently;
+- relative time semantics differ;
+- API natural-language create bypasses the intended V2 dialogue core;
+- retries without durable caller idempotency can become new operations.
+
+### 1.3 Structured finance read APIs
+
+Current structured GET APIs are deterministic and do not require LLM interpretation. They are not a problem by themselves, but they use a separate query/result contract.
+
+V2 rule: structured APIs may bypass the LLM **only because the caller already supplied structured semantics**. They still use the same deterministic query executor and FinanceResult model.
+
+### 1.4 Receipt
+
+Current active receipt path is approximately:
+
+```text
+Telegram photo
+  -> queue
+  -> Veryfi/provider extraction
+  -> optional item classification AI
+  -> direct transactions + transaction_items writes
+  -> Telegram reply
+```
+
+A second legacy receipt implementation remains executable in the repository.
+
+Problems:
+
+- receipt creation bypasses the unified finance executor;
+- receipt operations do not produce the same operation/audit/session/reference/result artifacts;
+- the created receipt and items are not first-class follow-up references;
+- queue retry and Telegram send state are not unified with operation idempotency/outbox.
+
+### 1.5 Final disposition of current paths
+
+| Current component | Final V2 disposition |
+|---|---|
+| `src/app.ts` transport/adapters | ADAPT |
+| Command NLP authority | REMOVE AFTER CUTOVER |
+| Conversation NLP authority and semantic regex gates | REMOVE AFTER CUTOVER |
+| `parseFinanceTextQuery` as natural-language authority | COMPATIBILITY ONLY, then remove from default path |
+| `parseIntake` natural-language authority | COMPATIBILITY ONLY, then remove |
+| legacy Telegram finance fallback | REMOVE AFTER CUTOVER |
+| deterministic SQL/read helpers | ADAPT/REUSE |
+| category/account DB lookup | ADAPT/REUSE |
+| receipt OCR/resolver/reconciliation | ADAPT/REUSE |
+| old receipt processor | VERSIONED COMPATIBILITY ONLY, then remove |
+| transaction and item ledger data | REUSE |
+| existing `ledger_operations` evidence | MIGRATE/ADAPT |
+
+There must be no hidden or automatic legacy fallback once an event is routed to V2.
 
 ---
 
 ## 2. Target architecture
 
 ```text
-Telegram / API / Receipt / Future channels
-                |
-                v
-          Finance Ingress
-                |
-                v
-     Finance Dialogue Orchestrator
-        (single LLM authority)
-                |
-                v
-          FinancePlan / Patch
-                |
-       +--------+---------+
-       |                  |
-       v                  v
- Session / Reference   Safety Policy
-       |                  |
-       +--------+---------+
-                |
-                v
-    Deterministic Finance Executor
-                |
-                v
-          FinanceResult
-                |
-                v
-            Renderer
-                |
-                v
-        Telegram / API response
+Channels
+Telegram text / Telegram photo / Structured API / Natural-language API / Queue
+                                  |
+                                  v
+                         Channel Adapters
+                    auth + event extraction only
+                                  |
+                                  v
+                         FinanceTurn Intake
+                identity + ordering + idempotency reservation
+                                  |
+                   +--------------+--------------+
+                   |                             |
+          natural-language turn            structured/machine turn
+                   |                             |
+                   v                             |
+          Dialogue Orchestrator                 |
+        (single user-language LLM)              |
+                   |                             |
+                   +-------------+---------------+
+                                 v
+                     Versioned FinancePlan
+                           or PlanPatch
+                                 |
+                                 v
+                  Deterministic Reference Resolver
+                                 |
+                                 v
+                    Deterministic Safety Policy
+                                 |
+                                 v
+                     Deterministic Executor
+                                 |
+                                 v
+      atomic commit: ledger + operation + audit + session/result + outbox
+                                 |
+                                 v
+                         Typed FinanceResult
+                          /               \
+                         v                 v
+                 Telegram Renderer     API Renderer
+                         |                 |
+                         v                 v
+                     Outbox Send      HTTP response/replay
 ```
 
-There must be only one natural-language route into finance behavior.
+Receipt extraction is upstream of a structured/machine-origin finance turn:
+
+```text
+Telegram photo
+  -> versioned Receipt Job
+  -> provider/OCR/resolver/reconciliation
+  -> ReceiptResolvedInput
+  -> optional caption through same Dialogue Orchestrator
+  -> structured CreatePlan
+  -> same Reference/Safety/Executor/Operation/Result/Outbox core
+```
 
 ---
 
-## 3. Core protocol: FinancePlan
+## 3. Core invariants
 
-`FinancePlan` is the contract between model understanding and deterministic code.
+These are implementation-blocking invariants.
 
-The model may create a new plan or patch an existing one. It must not directly emit SQL, transaction IDs that it invented, or mutation results.
+### 3.1 One semantic authority
 
-Suggested logical shape:
+For one natural-language finance turn:
+
+- at most one Finance Dialogue Orchestrator interpretation path;
+- retries may retry the **same orchestrator contract** after a transient technical failure or CAS reload;
+- retries may not call a different parser/schema to reinterpret the user.
+
+### 3.2 One write authority
+
+All finance writes go through the V2 deterministic executor:
+
+- create;
+- update;
+- delete;
+- restore;
+- receipt parent creation;
+- receipt item creation/update/delete/restore where supported.
+
+### 3.3 One operation identity
+
+Every side-effecting finance turn owns a durable `operation_id` and `idempotency_key`.
+
+Re-delivery must replay the original terminal result instead of executing again.
+
+### 3.4 One fact boundary
+
+All amounts, counts, transaction IDs, item IDs, categories, accounts, result membership, and mutation success come from code + D1, never from model memory.
+
+### 3.5 One result contract
+
+Telegram, API, analysis, and follow-up references consume the same typed `FinanceResult` / immutable ResultSet artifacts.
+
+### 3.6 Delivery is not commit
+
+A committed finance operation and a delivered Telegram message are separate lifecycle states.
+
+`HTTP 200`, Queue ack, D1 commit, Telegram API success, and actual user-visible delivery must not be conflated.
+
+---
+
+## 4. FinanceTurn protocol
+
+Every finance-capable event is normalized before interpretation/execution.
+
+```ts
+type FinanceChannel =
+  | 'telegram'
+  | 'api_natural_language'
+  | 'api_structured'
+  | 'receipt_queue'
+  | 'internal';
+
+interface FinanceActor {
+  tenant_id: string;
+  subject_id: string;
+  channel_user_id?: string;
+  permissions: string[];
+}
+
+interface FinanceTurn {
+  schema_version: 1;
+  turn_id: string;
+
+  channel: FinanceChannel;
+  channel_event_id: string;
+  idempotency_key: string;
+  payload_hash: string;
+
+  actor: FinanceActor;
+
+  session_key: string;
+  chat_id?: string;
+  thread_id?: string;
+  topic_id?: string;
+
+  ordering_key: string;
+  event_time: string;
+  received_time: string;
+  timezone: string;
+
+  text?: string;
+  attachment_refs: string[];
+
+  correlation_id: string;
+  causation_turn_id?: string;
+}
+```
+
+### 4.1 Session-key rule
+
+Telegram session identity must not be only `chat_id`.
+
+At minimum it is derived from:
+
+```text
+tenant + channel + chat + thread/topic + actor scope
+```
+
+so separate Telegram forum topics do not share mutable dialogue state accidentally.
+
+### 4.2 Actor/data scope
+
+Every read/write plan is executed under an authenticated actor scope.
+
+Even if the current deployment is effectively single-user, V2 must not encode “global ledger access” as an implicit invariant.
+
+### 4.3 Event time vs processing time
+
+Store both:
+
+- `event_time`: when the source event occurred;
+- `received_time`: when V2 received it.
+
+Natural date language is resolved against `event_time + timezone`, not Worker processing time.
+
+DB/audit metadata may also record commit time separately.
+
+### 4.4 Ordering
+
+Each adapter defines a stable `ordering_key`.
+
+For Telegram, message/update identifiers are retained in addition to timestamps.
+
+Rules:
+
+1. duplicate `channel_event_id` + same payload hash -> replay prior result;
+2. same event ID + different payload hash -> protocol conflict, no execution;
+3. stale event older than the session's last committed ordering point:
+   - never silently overwrite session state;
+   - never perform a mutation against newer context;
+   - return/replay a typed stale/clarification result according to policy;
+4. concurrent turns use session-version CAS;
+5. a CAS loser may reload and retry the same orchestrator once if the turn is still semantically valid and no side effect has committed; model-call count is recorded.
+
+---
+
+## 5. Orchestrator output protocol
+
+The Dialogue Orchestrator receives:
+
+- current `FinanceTurn`;
+- bounded recent turn summaries;
+- active normalized FinancePlan;
+- active ResultSet/reference metadata;
+- relevant category/account catalog;
+- event time/timezone;
+- capabilities/policy limits.
+
+It returns exactly one schema-constrained discriminated response:
+
+```ts
+type OrchestratorOutput =
+  | {
+      kind: 'new_plan';
+      schema_version: 1;
+      plan: FinancePlan;
+      field_confidence: Record<string, number>;
+    }
+  | {
+      kind: 'patch_plan';
+      schema_version: 1;
+      patch: FinancePlanPatch;
+      field_confidence: Record<string, number>;
+    }
+  | {
+      kind: 'clarification';
+      schema_version: 1;
+      reason_code: ClarificationReason;
+      question: string;
+      unresolved_fields: string[];
+    }
+  | {
+      kind: 'non_finance';
+      schema_version: 1;
+    };
+```
+
+### 5.1 Orchestrator may understand
+
+- create/query/summarize/analyze/compare/update/delete/restore;
+- multi-turn inheritance;
+- topic switches;
+- “这笔/那笔/第二笔/这些/刚才删掉的” reference semantics;
+- natural date and time language;
+- user-requested output fields;
+- grouping/sorting/pagination wording;
+- clarification need.
+
+### 5.2 Orchestrator may not do
+
+- invent transaction/item/operation IDs;
+- assert candidate uniqueness;
+- calculate authoritative totals;
+- decide DB authorization;
+- execute SQL;
+- claim a write succeeded;
+- silently downgrade ambiguous fields into default category/account;
+- bypass deterministic policy.
+
+### 5.3 Failure contract
+
+If the orchestrator times out or returns invalid schema:
+
+- read-only turn: return typed `interpretation_failed` or retry the same contract according to bounded retry policy;
+- mutation turn or mutation-like unresolved turn: fail closed;
+- never call Command, Conversation, regex intent, `parseIntake`, or another model schema as semantic fallback.
+
+---
+
+## 6. Versioned FinancePlan protocol
+
+All schemas are versioned and `additionalProperties: false` in the actual JSON schema.
 
 ```ts
 type FinanceOperation =
@@ -99,527 +430,1345 @@ type FinanceOperation =
   | 'delete'
   | 'restore';
 
-interface FinancePlan {
-  version: 2;
-  operation: FinanceOperation;
-  scope: FinanceScope;
-  filters: FinanceFilters;
-  selection: FinanceSelection;
-  changes?: FinanceChanges;
-  presentation: FinancePresentation;
-  references: FinanceReferences;
+interface PlanBase {
+  schema_version: 1;
+  plan_id: string;
+  plan_version: number;
+  base_session_version: number;
   source_turn_id: string;
-  confidence: number;
+  operation: FinanceOperation;
+  timezone: string;
+  temporal_scope?: FinanceTemporalScope;
+  references: ReferenceSpec[];
+  presentation: FinancePresentation;
 }
 ```
 
-### 3.1 FinanceScope
+The model may emit a temporary client-side `plan_id` token only if the code replaces/validates it; durable IDs are issued by code.
 
-Must support at least:
+### 6.1 Time scope
 
-- absolute date range
-- relative period resolved against event time
-- current result set
-- explicit recent-N
-- explicit current/previous period
-
-Natural expressions such as `上周六到今天`, `刚才`, `之前那些`, `本月`, `上一页这些` are interpreted by the model, but relative time is converted into explicit absolute boundaries before execution.
-
-### 3.2 FinanceFilters
-
-Must be composable, not sentence-specific:
-
-- transaction type
-- category
-- account
-- merchant
-- amount / amount range
-- semantic text condition
-- exact IDs resolved by code
-- inclusion/exclusion filters
-
-### 3.3 FinanceSelection
-
-Represents how a mutation chooses records:
-
-- all matching
-- exactly one matching
-- first/last/Nth in current result
-- explicit count
-- selected result IDs from current session
-
-The model describes selection semantics. Code resolves real rows and IDs.
-
-### 3.4 FinancePresentation
-
-Presentation is first-class conversation state, not hard-coded renderer behavior.
-
-Must support:
-
-- mode: summary/details/analysis/comparison
-- fields: date/item/amount/category/account/merchant/type/time
-- sort field and direction
-- page/page size
-- grouping
-- compact/full formatting
-
-This is required so a follow-up such as `要求带日期，支出项` becomes a plan patch rather than a new intent classification problem.
-
-### 3.5 FinanceReferences
-
-Must support explicit references to prior conversational state:
-
-- active plan
-- last result set
-- last mutation
-- result position (`第二笔`)
-- recent created transactions (`刚才两笔`)
-- recent deleted transactions
-- receipt-created transaction and items
-
-The model resolves language to reference semantics. Code resolves those semantics to durable IDs.
-
----
-
-## 4. PlanPatch and multi-turn behavior
-
-Every finance turn is interpreted with:
-
-1. current user message
-2. active session state
-3. recent finance turns
-4. current plan
-5. current result metadata
-6. reference catalog (valid categories/accounts)
-7. event time and timezone
-
-The model returns one of:
-
-- `new_plan`
-- `patch_plan`
-- `clarification_needed`
-- `non_finance`
-
-Example:
-
-Turn 1:
-
-`把上周六到今天的财务支出详细列出来`
-
-Plan:
-
-```json
-{
-  "operation": "query",
-  "scope": {"from": "2026-09-05", "to": "2026-09-07"},
-  "filters": {"type": "expense"},
-  "presentation": {"mode": "details", "page": 1}
-}
-```
-
-Turn 2:
-
-`要求带日期，支出项`
-
-Patch:
-
-```json
-{
-  "presentation": {
-    "fields": ["date", "item", "amount"]
-  }
-}
-```
-
-Turn 3:
-
-`只看餐饮`
-
-Patch:
-
-```json
-{
-  "filters": {"category": "餐饮"},
-  "presentation": {"page": 1}
-}
-```
-
-Turn 4:
-
-`金额最大的放前面`
-
-Patch:
-
-```json
-{
-  "presentation": {
-    "sort": {"field": "amount", "direction": "desc"}
-  }
-}
-```
-
-Turn 5:
-
-`这些一共多少钱`
-
-This may be represented as a new summarize plan referencing the active filtered result set rather than re-parsing the original period from scratch.
-
----
-
-## 5. Session state model
-
-The existing `finance_chat_context` is insufficient because it only stores range, label, mode, and last user text.
-
-V2 requires durable structured session state.
-
-Recommended new table (logical design; final migration can refine names):
-
-```text
-finance_sessions
-- chat_id / session_key PRIMARY KEY
-- version INTEGER
-- active_plan_json TEXT
-- active_result_json TEXT
-- recent_references_json TEXT
-- last_turn_id TEXT
-- last_event_time TEXT
-- updated_at TEXT
-- expires_at TEXT
-```
-
-### 5.1 active_plan_json
-
-Stores the normalized plan after every successful finance turn.
-
-### 5.2 active_result_json
-
-Must not blindly store large full result rows.
-
-Store bounded metadata sufficient for references:
-
-- query fingerprint
-- ordered result IDs for the visible page / bounded recent set
-- total count
-- page/page size
-- executed filter fingerprint
-- renderer metadata
-
-For large queries, code must be able to reproduce the result set deterministically from the plan rather than storing every row.
-
-### 5.3 recent_references_json
-
-Bounded, typed references such as:
-
-- last_created_ids
-- last_updated_ids
-- last_deleted_ids
-- last_restored_ids
-- last_receipt_transaction_id
-- previous_active_plan (optional bounded history)
-
-### 5.4 version and ordering
-
-Every update must use optimistic version checks so delayed or concurrent messages cannot silently overwrite newer state.
-
-Telegram event timestamp and update/message IDs must be part of turn metadata.
-
----
-
-## 6. Unified turn model
-
-Every incoming finance-capable message becomes a `FinanceTurn` before model interpretation.
+Natural-language dates are normalized before execution into explicit boundaries.
 
 ```ts
-interface FinanceTurn {
-  turn_id: string;
-  channel: 'telegram' | 'api' | 'receipt' | string;
-  channel_event_id: string;
-  chat_or_session_id: string;
-  text?: string;
-  event_time: string;
-  received_time: string;
+interface FinanceTemporalScope {
+  from: string;
+  to: string;
   timezone: string;
-  attachment_refs?: string[];
+  basis: 'event_time';
+  original_expression?: string;
 }
 ```
 
-This gives one idempotency and ordering model across channels.
+Rules:
+
+- end boundary is explicitly exclusive;
+- week start definition is configured and supplied to the orchestrator;
+- no executor code re-interprets user date prose;
+- code only validates normalized dates/bounds.
+
+### 6.2 Money
+
+```ts
+interface MoneyValue {
+  amount_fen: number;
+  currency: string;
+}
+```
+
+No floating-point authoritative amount is accepted by the executor.
+
+### 6.3 Create plan
+
+```ts
+interface CreateEntry {
+  client_entry_key: string;
+  type: 'expense' | 'income' | 'transfer';
+  amount: MoneyValue;
+  occurred_at: string;
+  merchant?: string | null;
+  description?: string | null;
+  category_ref?: CatalogReference | null;
+  account_ref?: CatalogReference | null;
+  items?: CreateItem[];
+}
+
+interface CreatePlan extends PlanBase {
+  operation: 'create';
+  entries: CreateEntry[];
+}
+```
+
+Multi-create is one logical operation with deterministic entry keys.
+
+### 6.4 Query / summarize
+
+```ts
+interface FinanceFilters {
+  type?: ('expense' | 'income' | 'transfer')[];
+  category_refs?: CatalogReference[];
+  account_refs?: CatalogReference[];
+  merchants?: string[];
+  text_terms?: string[];
+  amount_min_fen?: number;
+  amount_max_fen?: number;
+  include_transaction_ids?: string[];
+  exclude_transaction_ids?: string[];
+}
+
+interface QueryPlan extends PlanBase {
+  operation: 'query' | 'summarize';
+  filters: FinanceFilters;
+}
+```
+
+The LLM may express semantic filters; code resolves catalog/reference fields to real IDs before SQL.
+
+### 6.5 Analyze plan
+
+```ts
+interface AnalyzePlan extends PlanBase {
+  operation: 'analyze';
+  filters: FinanceFilters;
+  metrics: FinanceMetric[];
+  dimensions: FinanceDimension[];
+}
+```
+
+Analysis uses deterministic aggregation first.
+
+Optional prose generation is a separate post-execution model call and is **not** another intent interpreter.
+
+### 6.6 Compare plan
+
+```ts
+interface CompareSide {
+  temporal_scope: FinanceTemporalScope;
+  filters: FinanceFilters;
+}
+
+interface ComparePlan extends PlanBase {
+  operation: 'compare';
+  left: CompareSide;
+  right: CompareSide;
+  metrics: FinanceMetric[];
+  dimensions: FinanceDimension[];
+}
+```
+
+The comparison contract explicitly defines both sides; “previous period” is resolved during interpretation to concrete boundaries.
+
+### 6.7 Mutation selection
+
+```ts
+type FinanceSelection =
+  | { kind: 'exactly_one' }
+  | { kind: 'exact_count'; count: number }
+  | { kind: 'all_matching'; max_count: number }
+  | { kind: 'result_position'; result_set_id: string; ordinal: number }
+  | { kind: 'result_subset'; result_set_id: string; ordinals: number[] }
+  | { kind: 'reference'; reference: ReferenceSpec };
+
+interface MutationTarget {
+  temporal_scope?: FinanceTemporalScope;
+  filters: FinanceFilters;
+  selection: FinanceSelection;
+}
+```
+
+`exact_count: N` means code must resolve **exactly N**, not “up to N”.
+
+### 6.8 Update
+
+```ts
+interface FinanceChanges {
+  amount?: MoneyValue;
+  merchant?: string | null;
+  description?: string | null;
+  category_ref?: CatalogReference | null;
+  account_ref?: CatalogReference | null;
+  occurred_at?: string;
+}
+
+interface UpdatePlan extends PlanBase {
+  operation: 'update';
+  target: MutationTarget;
+  changes: FinanceChanges;
+}
+```
+
+Null/clear semantics are explicit in schema and never inferred from omitted fields.
+
+### 6.9 Delete
+
+```ts
+interface DeletePlan extends PlanBase {
+  operation: 'delete';
+  target: MutationTarget;
+}
+```
+
+### 6.10 Restore
+
+```ts
+interface RestorePlan extends PlanBase {
+  operation: 'restore';
+  deleted_operation_ref: ReferenceSpec;
+  target_subset?: FinanceSelection;
+}
+```
+
+Restore resolves an actual prior delete operation/tombstone. “Most recent delete” is valid only if the interpreted ReferenceSpec explicitly says so.
+
+### 6.11 Receipt item patch
+
+Receipt item follow-ups are represented through the same update/delete/restore operation family with typed item references. The target kind distinguishes `transaction`, `transaction_item`, `receipt_parent`, and `operation`.
 
 ---
 
-## 7. One LLM orchestration contract
+## 7. FinancePlanPatch semantics
 
-There must be one finance orchestration prompt/schema, not independent command and conversation schemas.
+Patch behavior is intentionally strict so implementers cannot invent merge semantics.
 
-The model input must contain only bounded, relevant structured context.
+```ts
+interface FinancePlanPatch {
+  schema_version: 1;
+  base_plan_id: string;
+  base_plan_version: number;
+  base_session_version: number;
 
-The model output must be schema-constrained.
+  temporal_scope?: ReplaceOrClear<FinanceTemporalScope>;
+  filters?: ReplaceOrClear<FinanceFilters>;
+  selection?: ReplaceOrClear<FinanceSelection>;
+  changes?: ReplaceOrClear<FinanceChanges>;
+  presentation?: ReplaceOrClear<FinancePresentation>;
+  references?: ReplaceOrClear<ReferenceSpec[]>;
+}
+```
 
-The orchestrator is allowed to understand:
+Where:
 
-- create/query/summarize/analyze/compare/update/delete/restore
-- context inheritance
-- reference language
-- presentation changes
-- topic switches
-- natural date language
-- clarification requirements
+```ts
+type ReplaceOrClear<T> =
+  | { mode: 'replace'; value: T }
+  | { mode: 'clear' };
+```
 
-The orchestrator is not allowed to:
+Rules:
 
-- invent DB IDs
-- claim a mutation succeeded
-- directly decide that multiple real DB candidates are unique
-- compute financial totals from memory when DB execution is available
-- bypass executor safety
+1. omitted top-level component = inherit unchanged;
+2. supplied component = replace the whole component;
+3. lists are replaced, never implicitly appended;
+4. `clear` is explicit;
+5. no deep implicit merge;
+6. every patch carries base plan/session version;
+7. version mismatch -> no execution; reload/re-orchestrate or clarification;
+8. filter/sort changes reset pagination unless the new presentation explicitly supplies a valid page token;
+9. a reference tied to an invalidated ResultSet is rejected, not silently re-queried;
+10. code creates the new durable plan version after validation.
 
-If orchestration fails or returns invalid output:
-
-- non-destructive request may return a safe retry/fallback message
-- mutation request must fail closed
-- mutation request must never fall into a second AI parser that might execute a different interpretation
+This lets `要求带日期，支出项` change presentation without reclassifying the whole conversation through a second parser.
 
 ---
 
-## 8. Deterministic executor
+## 8. Presentation protocol
 
-The executor must be model-agnostic.
+Presentation is persistent plan state.
+
+```ts
+interface FinancePresentation {
+  mode: 'summary' | 'details' | 'analysis' | 'comparison';
+  fields: FinanceField[];
+  sort: FinanceSort[];
+  grouping: FinanceDimension[];
+  page_size: number;
+  page_token?: string;
+  format: 'compact' | 'full';
+}
+
+interface FinanceSort {
+  field: FinanceField;
+  direction: 'asc' | 'desc';
+}
+```
+
+Rules:
+
+- renderer obeys structured presentation only;
+- renderer does not infer missing user intent;
+- every sort has a deterministic tie-breaker added by code (`transaction_id` or immutable ordinal);
+- pagination uses immutable ResultSet ordinals/page tokens, not live offset re-query;
+- changing filters/sort creates a new ResultSet.
+
+---
+
+## 9. Durable session model: turn log + projection + immutable result sets
+
+The old single-row `finance_chat_context` is compatibility-only.
+
+V2 uses three distinct concepts.
+
+### 9.1 Append-only `finance_turns`
+
+Logical columns:
+
+```text
+turn_id PRIMARY KEY
+schema_version
+tenant_id
+subject_id
+channel
+channel_event_id
+idempotency_key
+payload_hash
+session_key
+chat_id
+thread_id
+topic_id
+ordering_key
+event_time
+received_time
+timezone
+correlation_id
+causation_turn_id
+interpretation_status
+policy_status
+execution_status
+result_id
+operation_id
+model_call_count
+created_at
+```
+
+`channel_event_id` + actor/channel scope has a uniqueness contract.
+
+Turn payload retention must follow privacy policy; raw text is not required indefinitely.
+
+### 9.2 Mutable `finance_sessions` projection
+
+Logical columns:
+
+```text
+session_key PRIMARY KEY
+version
+active_plan_id
+active_plan_version
+active_result_set_id
+active_topic
+last_committed_turn_id
+last_ordering_key
+reference_index_version
+updated_at
+expires_at
+```
+
+All updates use CAS on `version`.
+
+The projection can be rebuilt from durable turns/plans/results if required.
+
+### 9.3 Versioned plan store
+
+```text
+finance_plans
+- plan_id
+- plan_version
+- session_key
+- source_turn_id
+- schema_version
+- plan_json
+- created_at
+PRIMARY KEY(plan_id, plan_version)
+```
+
+Plans are immutable versions.
+
+### 9.4 Immutable ResultSet
+
+A query result used by conversation references is materialized as a stable handle.
+
+```text
+finance_result_sets
+- result_set_id PRIMARY KEY
+- session_key
+- source_turn_id
+- plan_id
+- plan_version
+- query_fingerprint
+- ledger_snapshot_token
+- total_count
+- created_at
+- expires_at
+
+finance_result_set_items
+- result_set_id
+- ordinal
+- entity_type
+- entity_id
+- entity_version
+PRIMARY KEY(result_set_id, ordinal)
+```
+
+This solves:
+
+- `第二笔`;
+- `这些`;
+- `上一页这些`;
+- stable pagination;
+- later inserts changing page membership.
+
+The implementation must not use “re-run the old query and hope ordering is unchanged” as the primary reference strategy.
+
+### 9.5 Result-set lifetime
+
+ResultSet handles have:
+
+- explicit TTL;
+- explicit session/topic scope;
+- typed entity membership;
+- immutable ordinal;
+- stale-row detection via entity version where applicable.
+
+If a referenced row changed after snapshot, policy decides whether to require clarification/reload; code does not silently mutate a different row.
+
+### 9.6 Topic switch
+
+The orchestrator may open a new plan within the same session when the user changes topic.
+
+The session projection keeps only one active pointer, but recent typed references/plans remain addressable within bounded retention.
+
+A new topic must not destroy durable history needed for explicit references such as “回到刚才那组烟酒支出”.
+
+---
+
+## 10. Typed reference protocol
+
+```ts
+type ReferenceSpec =
+  | { kind: 'active_plan' }
+  | { kind: 'result_set'; result_set_id: string }
+  | { kind: 'result_position'; result_set_id: string; ordinal: number }
+  | { kind: 'transaction'; semantic_key: string }
+  | { kind: 'transaction_item'; receipt_ref: string; ordinal?: number; semantic_key?: string }
+  | { kind: 'receipt'; semantic_key: string }
+  | { kind: 'operation'; operation_kind?: string; recency?: 'latest' | 'previous'; semantic_key?: string }
+  | { kind: 'created_by_turn'; turn_id: string }
+  | { kind: 'deleted_by_operation'; operation_id: string };
+```
+
+The JSON schema used by the model must not accept arbitrary DB IDs as if trusted.
+
+### 10.1 Resolver responsibilities
+
+Code resolves references into:
+
+```ts
+interface ReferenceResolution {
+  status: 'resolved' | 'no_match' | 'ambiguous' | 'expired' | 'stale' | 'forbidden';
+  entity_type?: string;
+  entity_ids: string[];
+  candidate_count: number;
+  candidate_summaries?: SafeCandidateSummary[];
+}
+```
+
+### 10.2 Resolution priority
+
+The resolver follows explicit structured reference type, not regex against the original user prose.
+
+Typical priority:
+
+1. explicit ResultSet/ordinal;
+2. explicit prior operation/tombstone;
+3. current receipt/item reference;
+4. session recent-reference index;
+5. constrained semantic DB filter from the plan.
+
+### 10.3 Ambiguity
+
+Ambiguity is a code fact.
+
+The LLM may request a clarification, but it may not convert multiple real candidates into one by confidence.
+
+### 10.4 Receipt references
+
+`这张小票` resolves to a durable receipt/parent reference created by the receipt operation, scoped to the same actor/session/topic unless the plan explicitly chooses another scope.
+
+`第二项` resolves using immutable item order stored for that receipt version.
+
+---
+
+## 11. Unified operation, idempotency, and audit contract
+
+All finance writes, including receipt writes, use a unified operation record.
+
+Logical table:
+
+```text
+finance_operations
+- operation_id PRIMARY KEY
+- schema_version
+- idempotency_key UNIQUE
+- turn_id
+- session_key
+- actor_subject_id
+- operation_type
+- status
+- plan_id
+- plan_version
+- target_count
+- before_snapshot_ref
+- after_snapshot_ref
+- result_id
+- error_code
+- created_at
+- committed_at
+```
+
+Recommended operation states:
+
+```text
+reserved
+interpreted
+policy_rejected
+ready
+executing
+committed
+failed_precommit
+```
+
+After `committed`, replay does not execute again.
+
+Delivery status is not stored as operation status.
+
+### 11.1 Idempotency reservation
+
+Before a mutation executes:
+
+1. reserve unique `idempotency_key`;
+2. if already terminal, replay stored FinanceResult;
+3. if in progress, return typed `in_progress`/retry semantics;
+4. do not issue a second mutation.
+
+### 11.2 Key derivation
+
+- Telegram: actor/channel + update/message identity + operation slot;
+- API: caller-supplied idempotency key is required for mutation; compatibility routes without one receive a generated key only if retry semantics are explicitly documented;
+- Queue receipt: stable receipt source identity + job version.
+
+### 11.3 Create audit
+
+Create is no longer outside the operation model.
+
+Create, update, delete, restore, and receipt creation all produce operation/audit evidence.
+
+### 11.4 Existing `ledger_operations`
+
+Migration design may:
+
+- extend it into the new operation/audit model; or
+- preserve it as immutable legacy evidence and introduce new V2 tables.
+
+The implementation must not rewrite or discard historical audit evidence without a separate migration/recovery plan.
+
+---
+
+## 12. Deterministic safety policy
+
+Safety is centralized and channel-independent.
+
+### 12.1 Authorization and scope
+
+Before DB resolution:
+
+- validate actor;
+- validate tenant/ledger scope;
+- validate session/topic reference scope;
+- reject cross-scope references unless explicitly authorized.
+
+### 12.2 Cardinality
+
+- `exactly_one`: candidate count must equal 1;
+- `exact_count:N`: candidate count must equal N;
+- `all_matching`: candidate count must be <= explicit policy max;
+- partial mutation is forbidden when requested cardinality is not satisfied.
+
+### 12.3 Row version / CAS
+
+Mutation targets carry/read entity version where possible.
+
+If a target changed after the referenced ResultSet/snapshot, mutation does not silently apply to a newer state.
+
+### 12.4 Money
+
+Validate:
+
+- integer fen;
+- positive/allowed bounds;
+- supported currency;
+- currency consistency for aggregates/compare;
+- no floating-point ledger writes.
+
+### 12.5 Category/account
+
+DB resolver must distinguish:
+
+- resolved;
+- ambiguous;
+- invalid-for-transaction-type;
+- inactive/historical-only;
+- missing.
+
+Silent semantic downgrade to `其他支出` / unspecified is allowed only under an explicit product policy for that operation, and the downgrade must be represented in the result/audit. It must never masquerade as high-confidence resolution.
+
+### 12.6 Delete/restore
+
+Delete captures enough immutable snapshot data to restore the same entity/items.
+
+Restore requires a real delete/tombstone operation reference and honors current authorization.
+
+### 12.7 Receipt invariants
+
+Before receipt commit:
+
+- provider result validated;
+- amount reconciliation policy satisfied;
+- parent/item amount invariants satisfied;
+- item order stable;
+- account/category mappings policy-valid.
+
+### 12.8 Prompt injection / untrusted text
+
+Merchant descriptions, receipt OCR, prior user text, and catalog labels are data, not instructions.
+
+The orchestrator/provider prompts must use schema-constrained outputs and bounded context.
+
+### 12.9 Cost/rate limits
+
+Model and external-provider calls have:
+
+- per-turn budget;
+- retry cap;
+- timeout;
+- observable call count;
+- kill switch.
+
+A cost-limit failure before mutation is fail-closed.
+
+### 12.10 Error taxonomy
+
+At minimum:
+
+```text
+interpretation_failed
+clarification_required
+unauthorized
+forbidden_scope
+no_match
+ambiguous_target
+expired_reference
+stale_reference
+stale_turn
+cardinality_mismatch
+invalid_money
+invalid_category
+invalid_account
+policy_rejected
+idempotency_conflict
+in_progress
+db_read_failed
+db_commit_failed
+provider_failed
+render_failed
+delivery_pending
+delivery_failed
+```
+
+Internal provider/DB details are not returned raw to users.
+
+---
+
+## 13. Deterministic executor
+
+The executor accepts only validated structured plans/resolutions.
+
+It does not read user prose.
 
 Responsibilities:
 
-- resolve plan filters against D1
-- resolve real transaction IDs
-- validate categories/accounts
-- exact money math in fen
-- enforce requested scope and count
-- execute create/update/delete/restore atomically
-- read receipt items
-- calculate summaries/analysis inputs
-- stable sorting and pagination
-- emit typed `FinanceResult`
+- deterministic D1 reads;
+- stable query ordering;
+- immutable ResultSet creation;
+- exact aggregates;
+- category/account lookup;
+- target resolution;
+- row/version checks;
+- create/update/delete/restore;
+- receipt parent/items;
+- before/after capture;
+- typed FinanceResult.
 
-The executor must be callable from Telegram, API, tests, and future clients without any channel-specific business logic.
-
----
-
-## 9. Safety policy
-
-Safety is a dedicated deterministic policy layer, not scattered branches.
-
-### 9.1 Mutations
-
-For update/delete:
-
-- if user semantics require one record but code resolves >1 candidate: reject and ask for clarification
-- if explicit multi-selection is present: enforce exact bounded selection
-- never let the model's confidence override real candidate ambiguity
-- never infer a destructive target solely because it is the latest DB row unless the interpreted plan explicitly references latest/recent semantics
-
-### 9.2 Restore
-
-Restore must reference real prior delete audit/history. It must not recreate a guessed transaction.
-
-### 9.3 Atomicity
-
-All multi-row mutations and audit writes must be all-or-nothing.
-
-### 9.4 Idempotency
-
-All externally delivered turns must have a durable idempotency key, not only create requests.
-
-A replayed update/delete/restore turn must not apply the same mutation twice.
-
-### 9.5 Fail closed
-
-If model, DB, or policy validation fails during a mutation, no mutation is applied and no secondary parser is attempted.
+Channel-specific behavior is forbidden in the executor.
 
 ---
 
-## 10. Unified result model
+## 14. Atomic commit boundary
 
-Executor output should be typed before rendering.
+For a side-effecting finance operation, the durable commit boundary must atomically establish as much as belongs to the finance state transition:
+
+- ledger row/item changes;
+- operation terminal state;
+- before/after audit evidence;
+- plan/session projection advancement;
+- resulting references/result handle;
+- idempotency terminal result;
+- Telegram outbox record when a Telegram response is required.
+
+The exact D1 mechanism may be chosen during implementation, but atomicity must be proven with failure-injection tests.
+
+### 14.1 Renderer/send after commit
+
+Rendering and external send happen after finance commit.
+
+If Telegram send fails:
+
+- ledger operation remains committed;
+- outbox remains pending/failed-retryable;
+- retry uses the same outbox/message identity;
+- no ledger re-execution;
+- no duplicate user-visible message where platform idempotency/dedup can prevent it.
+
+### 14.2 Read-only turns
+
+Read-only turn/session/result persistence may use a smaller transaction boundary, but session projection and ResultSet creation must not produce contradictory state.
+
+---
+
+## 15. FinanceResult and lifecycle protocol
+
+Do not overload one `status` field with execution and delivery meanings.
 
 ```ts
 interface FinanceResult {
-  operation: FinanceOperation;
-  status: 'applied' | 'rejected' | 'clarification' | 'no_match' | 'success';
-  transaction_ids: string[];
+  schema_version: 1;
+  result_id: string;
+  turn_id: string;
+  operation_id?: string;
+  plan_id: string;
+  plan_version: number;
+
+  interpretation_status:
+    | 'interpreted'
+    | 'clarification'
+    | 'failed'
+    | 'non_finance';
+
+  policy_status:
+    | 'not_required'
+    | 'approved'
+    | 'rejected';
+
+  execution_status:
+    | 'not_started'
+    | 'no_match'
+    | 'executed'
+    | 'failed';
+
+  commit_status:
+    | 'not_applicable'
+    | 'not_committed'
+    | 'committed';
+
+  replay_status:
+    | 'original'
+    | 'duplicate_replay'
+    | 'in_progress';
+
   rows?: FinanceResultRow[];
   summary?: FinanceSummary;
-  pagination?: FinancePagination;
-  analysis_input?: FinanceAnalysisData;
-  audit_ids?: string[];
-  state_patch?: SessionStatePatch;
+  analysis_data?: FinanceAnalysisData;
+  comparison_data?: FinanceComparisonData;
+  result_set_id?: string;
+  transaction_ids: string[];
+  item_ids: string[];
+  audit_ids: string[];
+  safe_error?: FinanceError;
 }
 ```
 
-The renderer must not re-query or reinterpret user intent.
+Render and delivery are separate records.
+
+### 15.1 Replay
+
+A duplicate committed mutation returns the original stored FinanceResult with `duplicate_replay`.
+
+It does not re-run target selection against current DB state.
 
 ---
 
-## 11. Rendering strategy
+## 16. Renderer and outbox
 
-Rendering should be deterministic by default for factual outputs.
+### 16.1 Renderer
 
-Examples:
+Renderer input:
 
-- ledger rows
-- totals
-- before/after mutation confirmations
-- pagination
-- dates
+- FinanceResult;
+- FinancePresentation;
+- safe locale/channel metadata.
 
-An LLM may generate prose for analysis/recommendations only from structured `FinanceResult` data. It must never invent amounts or causes.
+Renderer must not:
 
-Presentation fields from `FinancePlan` must map directly to renderer output.
+- call the dialogue orchestrator;
+- re-query the ledger to reconstruct facts;
+- reinterpret user prose;
+- change the target/result set.
 
----
+### 16.2 Deterministic factual rendering
 
-## 12. Receipt integration
+Dates, rows, amounts, totals, pagination, before/after mutation confirmations are deterministic.
 
-Receipt processing must join the same reference model after OCR/provider resolution.
+### 16.3 Analysis prose
 
-After receipt creation:
+An optional post-execution LLM may turn structured `analysis_data` into concise prose.
 
-- created parent transaction ID is written to session references
-- item IDs are referenceable
-- follow-ups such as `第二项改成日用品`, `这张小票撤销`, `刚才超市那笔金额不对` must use the same orchestrator + executor path
+Contract:
 
-Receipt extraction itself can remain a specialized pipeline; post-extraction finance semantics must not remain a separate conversational island.
+- it is not an intent parser;
+- it receives no authority to change the plan or result;
+- amounts/percentages are supplied from code;
+- output is schema-constrained or bounded into known sections;
+- call count/cost/failure is observable;
+- failure falls back to deterministic analysis rendering, not to another semantic parser.
 
----
+### 16.4 Outbox
 
-## 13. API and Telegram adapters
+Logical table:
 
-Adapters may handle:
+```text
+finance_outbox
+- outbox_id PRIMARY KEY
+- turn_id
+- result_id
+- channel
+- destination_key
+- render_version
+- payload_hash
+- status
+- attempt_count
+- next_attempt_at
+- last_error_code
+- created_at
+- sent_at
+```
 
-- authentication
-- webhook validation
-- message extraction
-- Telegram sending
-- HTTP response encoding
+Status example:
 
-Adapters must not contain finance intent logic.
+```text
+pending
+sending
+sent
+failed_retryable
+failed_terminal
+```
 
-Both must call the same finance core.
-
----
-
-## 14. Existing code disposition
-
-This blueprint does not require deleting old files on day one. It defines the final ownership model.
-
-### Keep / evolve
-
-- finance reference catalog and category/account resolvers
-- transaction D1 schema
-- transaction_items
-- ledger_operations, possibly extended
-- Telegram event-time utilities
-- receipt extraction/resolution pipeline
-- deterministic DB query helpers where reusable
-
-### Replace / absorb into V2
-
-- Finance Command Layer as an independent NLP authority
-- Finance Conversation Layer as an independent NLP authority
-- deterministic `parseFinanceTextQuery` as a semantic authority
-- legacy Telegram finance interpretation fallback
-
-### Temporary compatibility only
-
-Old parsers may exist behind a compatibility adapter during migration, but production finance traffic must have one clearly measurable primary path and no mutation fall-through.
+A send retry never re-executes finance logic.
 
 ---
 
-## 15. Migration strategy
+## 17. API and Telegram behavior contract
 
-Do not big-bang replace production.
+### 17.1 Telegram natural language
 
-### Phase A - Architecture freeze
+All finance-capable text enters V2 FinanceTurn -> single orchestrator.
 
-- finalize this blueprint
-- no product code changes
-- enumerate every current finance entry path
-- map current tests to V2 behavior
+No Command/Conversation/regex/legacy automatic semantic fallback in V2 mode.
 
-### Phase B - V2 core in isolated branch
+### 17.2 Structured read API
 
-Implement:
+Structured read endpoints may construct a structured QueryPlan directly without LLM.
 
-- FinanceTurn
-- FinancePlan / PlanPatch schema
-- Orchestrator
-- session store
-- reference resolver
-- safety policy
-- executor
-- result model
-- renderer
+They still use:
 
-No production route switch yet.
+- actor scope;
+- deterministic executor;
+- FinanceResult;
+- unified sorting/result semantics.
 
-### Phase C - Compatibility tests
+### 17.3 Natural-language API
 
-Run existing create/query/conversation/receipt behavior through V2 and compare with current production semantics.
+Preferred V2 endpoint is a versioned finance-turn contract, e.g. `/v2/finance/turn`.
 
-### Phase D - Shadow mode
+If `/v1/intake` remains during migration:
 
-For production Telegram text requests:
+- it is explicitly labeled compatibility;
+- route mode is observable;
+- it never becomes automatic fallback from V2;
+- its write permissions can be disabled independently;
+- its retirement date/gate is defined.
 
-- V1 continues to answer/execute
-- V2 interprets read-only in shadow mode
-- no V2 mutation
-- compare route/plan/result metadata
-- redact sensitive values from logs
+### 17.4 API idempotency
 
-Mutation shadow mode may interpret and resolve candidates but must not write.
+Mutation API callers must supply a durable idempotency key in V2.
 
-### Phase E - Canary
+### 17.5 Cross-channel sessions
 
-Enable V2 for a controlled finance subset / user scope.
+No implicit cross-channel context sharing.
 
-### Phase F - full cutover
-
-V2 becomes the only finance natural-language path.
-
-### Phase G - remove semantic duplicates
-
-Delete or demote legacy NLP paths only after cutover evidence.
+If Telegram and API should share a session, that mapping must be explicit and actor-authorized.
 
 ---
 
-## 16. Rollback design
+## 18. Analysis and comparison
 
-Rollback must be possible without reversing ledger data.
+`analyze` and `compare` are first-class FinancePlan operations, not separate NLP route schemas.
 
-- V2 schema migrations should be additive before cutover.
-- V1 data tables remain readable during migration.
-- feature flag / route flag can return finance traffic to V1 before V1 semantic code is removed.
-- no migration should destructively rewrite transactions just to support V2.
+### 18.1 Analyze
+
+Flow:
+
+```text
+orchestrator interpretation
+  -> deterministic data query/aggregation
+  -> FinanceAnalysisData
+  -> optional prose model
+  -> renderer
+```
+
+### 18.2 Compare
+
+Both comparison sides are explicit in the plan.
+
+Code computes:
+
+- expense;
+- income;
+- transfer if requested;
+- net;
+- requested dimensions/metrics.
+
+The prose model cannot redefine the comparison period.
+
+### 18.3 Model call budget
+
+Expected baseline:
+
+- ordinary natural-language turn: 1 interpretation model call;
+- analysis with prose: 1 interpretation + at most 1 prose-generation call;
+- receipt item taxonomy may add the bounded provider/classification call defined in receipt policy.
+
+No second interpretation parser is allowed.
 
 ---
 
-## 17. Required acceptance matrix
+## 19. Receipt integration contract
 
-V2 is not complete when a list of isolated sentences passes. It is complete only after full dialogue scenarios pass.
+Receipt is a professional extraction adapter feeding the same finance core.
 
-### 17.1 Single-turn baseline
+### 19.1 ReceiptTurn / job
 
-- create one
-- create multiple
-- query
-- summary
-- analysis
-- compare
-- update
-- delete
-- restore
-- receipt creation
+Versioned job:
 
-### 17.2 Multi-turn query refinement
+```ts
+interface ReceiptJob {
+  schema_version: 2;
+  job_id: string;
+  source_event_id: string;
+  idempotency_key: string;
+  turn_id: string;
+  actor: FinanceActor;
+  session_key: string;
+  event_time: string;
+  timezone: string;
+  attachment_ref: string;
+  caption?: string;
+  attempt: number;
+}
+```
 
-Required scenario:
+Old queue jobs retain their old version and use a compatibility decoder/consumer until drained.
+
+### 19.2 Extraction
+
+Provider/OCR produces:
+
+```ts
+interface ReceiptResolvedInput {
+  schema_version: 1;
+  provider: string;
+  provider_attempt_id: string;
+  merchant?: string;
+  total_fen: number;
+  currency: string;
+  occurred_at?: string;
+  payment_hint?: string;
+  items: ReceiptResolvedItem[];
+  reconciliation: ReceiptReconciliation;
+}
+```
+
+Provider output is untrusted until code validation/reconciliation passes.
+
+### 19.3 Caption
+
+Caption is user natural language.
+
+If caption contains finance semantics such as “算日用品，用支付宝”:
+
+- the same Dialogue Orchestrator interprets the caption against the bounded `ReceiptResolvedInput`;
+- no receipt-specific natural-language parser is added.
+
+If caption is absent, code may construct a deterministic machine-origin CreatePlan from validated extraction to avoid unnecessary dialogue interpretation.
+
+### 19.4 Commit
+
+Receipt creation uses the same executor/operation/idempotency/audit/result/outbox boundary.
+
+It may not directly insert `transactions` from the queue processor.
+
+### 19.5 References
+
+After commit, store typed durable references to:
+
+- receipt/attachment;
+- parent transaction;
+- ordered item IDs;
+- create operation;
+- source event.
+
+Then follow-ups such as:
+
+- `第二项改成日用品`;
+- `这张小票撤销`;
+- `刚才超市那笔金额不对`
+
+use the same orchestrator/reference/safety/executor core.
+
+### 19.6 Provider/classification failures
+
+Policy must explicitly decide:
+
+- fail receipt;
+- continue with unresolved category;
+- request user clarification.
+
+A classification-model error may not silently masquerade as a high-confidence category.
+
+### 19.7 Queue retry and delivery
+
+Receipt processing is at-least-once, but operation commit is exactly-once by idempotency key.
+
+Telegram final messages use outbox state.
+
+---
+
+## 20. Observability contract
+
+Every production finance event must be traceable by safe identifiers:
+
+- `turn_id`;
+- `channel_event_id`;
+- `correlation_id`;
+- `session_key` hash/safe ID;
+- session version;
+- plan ID/version;
+- operation ID;
+- idempotency key hash;
+- model call count;
+- provider call count;
+- reference resolution status;
+- target count;
+- policy status;
+- commit status;
+- result ID/result-set ID;
+- outbox ID;
+- delivery attempt/status;
+- Queue job version/attempt.
+
+### 20.1 Privacy
+
+Do not log:
+
+- secrets/tokens;
+- raw Authorization;
+- full OCR payload by default;
+- full raw user finance text in long-retention telemetry;
+- full before/after finance snapshots in ordinary logs.
+
+Durable audit data and operational telemetry have separate retention/access policy.
+
+### 20.2 Success meanings
+
+Telemetry and health reporting distinguish:
+
+```text
+request accepted
+turn interpreted
+policy approved
+DB committed
+Queue acked
+outbox sent
+Telegram API accepted
+delivery terminal/unknown
+```
+
+No generic `PASS` may collapse those into one state.
+
+---
+
+## 21. Shadow mode contract
+
+Shadow mode exists only to compare interpretation safely.
+
+### 21.1 Absolute production side-effect prohibition
+
+Shadow V2 may not:
+
+- write production D1;
+- write production R2;
+- enqueue production Queue messages;
+- create/update session projection;
+- reserve production idempotency/operation records;
+- create production ResultSets;
+- create outbox records;
+- send Telegram/API responses;
+- call Veryfi or another external receipt provider;
+- persist attachments;
+- invoke mutation executor;
+- alter V1 behavior.
+
+### 21.2 Allowed shadow work
+
+For sampled Telegram text turns only:
+
+- construct an in-memory FinanceTurn snapshot;
+- load bounded read-only context through an isolated read path;
+- call the single V2 interpretation model under a cost budget;
+- validate the returned plan in memory;
+- compare redacted/structural fields against V1 observed outcome.
+
+Optional shadow telemetry must use a dedicated isolated dataset/namespace and contain only redacted aggregate or hashed metadata, never production session state or raw finance text.
+
+### 21.3 Cost/privacy
+
+Define:
+
+- sampling percentage;
+- per-day model-call budget;
+- kill switch;
+- no analysis prose shadow call unless specifically approved;
+- retention of comparison metadata;
+- no raw sensitive text.
+
+### 21.4 Proof
+
+Shadow acceptance requires evidence that a shadow divergence cannot affect V1 execution or user-visible response.
+
+---
+
+## 22. Migration and rollback contract
+
+V2 database evolution is forward-compatible and additive until full cutover evidence is complete.
+
+### 22.1 Migration families
+
+New migration(s), expected from 0008 onward, may create:
+
+- finance_turns;
+- finance_sessions;
+- finance_plans;
+- finance_result_sets;
+- finance_result_set_items;
+- finance_operations / audit extensions;
+- finance_outbox;
+- receipt attempt/job metadata;
+- entity version support if required.
+
+Do not destructively rewrite `transactions` merely to support V2.
+
+### 22.2 Existing 0001-0007 compatibility matrix
+
+Implementation tests must explicitly cover:
+
+1. fresh DB applying 0001 through new V2 migrations;
+2. production-like DB already at 0007 upgrading forward;
+3. inactive categories introduced by 0006 remain historically readable;
+4. 0005 recovery-log FK interaction with delete/restore;
+5. legacy 0007 audit rows remain readable/explainable;
+6. old transaction source/source_id uniqueness remains valid;
+7. transaction_items cascade behavior remains compatible with restore design.
+
+### 22.3 Old Worker / new schema
+
+Before migration:
+
+- prove the current production Worker can continue operating with additive V2 tables present;
+- no new NOT NULL/constraint change may break old writes during the compatibility window.
+
+### 22.4 New Worker / old data
+
+V2 must read existing ledger/history without requiring destructive rewrite.
+
+### 22.5 Rollback philosophy
+
+Production rollback is primarily **route rollback/forward-fix**, not reverse-migration of committed ledger data.
+
+If V2 is disabled after legitimate V2 user mutations:
+
+- existing transactions remain visible to V1;
+- V2 operation/session/outbox tables may remain;
+- do not reverse valid user finance actions merely because code was rolled back.
+
+A defective V2 mutation requires an explicit compensating/recovery procedure with audit evidence, not blanket DB downgrade.
+
+### 22.6 No destructive down migration requirement
+
+Additive tables need not be dropped during emergency route rollback.
+
+Schema rollback that risks data loss is not the primary recovery mechanism.
+
+### 22.7 Queue in-flight versioning
+
+Receipt Queue jobs carry schema version.
+
+Cutover must define:
+
+- last time old-version jobs are accepted;
+- old-job drain metric;
+- compatibility decoder/consumer lifetime;
+- removal gate for old receipt processor.
+
+### 22.8 Feature/cutover flags
+
+Logical route state:
+
+```text
+v1
+shadow
+canary
+v2
+```
+
+Separate controls exist for:
+
+- text finance route;
+- natural-language API;
+- receipt job producer;
+- receipt consumer version;
+- legacy write compatibility.
+
+Flags are observable and reversible before legacy deletion.
+
+---
+
+## 23. Cutover gates and legacy deletion
+
+Legacy semantic code is not deleted merely because V2 unit tests pass.
+
+### 23.1 Required route states
+
+Every current semantic path is labeled in rollout metadata as one of:
+
+```text
+primary_v1
+shadow_v2
+canary_v2
+primary_v2
+compatibility_only
+disabled
+removed
+```
+
+### 23.2 Hard prohibition
+
+In `primary_v2`:
+
+- mutation failure does not fall into legacy;
+- natural-language Telegram does not call Command NLP, Conversation NLP, regex intent, or `parseIntake`;
+- legacy `/v1/intake` is only reachable by its explicit compatibility endpoint/mode.
+
+### 23.3 Deletion candidates
+
+After evidence and compatibility window:
+
+- Command NLP classification;
+- Conversation route schema/semantic regex gates;
+- default `parseFinanceTextQuery` language authority;
+- `parseIntake` language authority;
+- legacy finance Telegram fallback;
+- production test hook `__mockParsedIntake`;
+- old receipt processor after job drain.
+
+### 23.4 Minimum deletion evidence
+
+Before removing each path:
+
+- no production traffic uses it for the defined window;
+- corresponding V2 E2E suite passes;
+- rollback no longer depends on that code;
+- receipt old-job backlog is zero for old processor deletion;
+- canary/full V2 has no unresolved P0/P1 semantic or mutation defect.
+
+---
+
+## 24. Architecture guard contract
+
+Architecture guards inspect the actual production import/call graph or enforce equivalent static/runtime invariants.
+
+Required assertions:
+
+1. one natural-language text turn can reach only one Dialogue Orchestrator entry;
+2. orchestrator error cannot invoke a second semantic parser;
+3. all finance writes originate from the V2 executor package;
+4. adapter files contain no finance semantic-routing regex/keyword branches;
+5. renderer cannot import/write ledger executor;
+6. receipt provider/queue adapter cannot directly write transaction tables;
+7. compatibility parser cannot be imported by primary V2 route;
+8. one channel event maps to one durable turn/idempotency reservation;
+9. a committed operation replay cannot execute mutation SQL again;
+10. structured API bypass of LLM is explicit and type-level, not based on keyword guessing.
+
+A guard that only checks file names/existence is insufficient.
+
+---
+
+## 25. Test and acceptance contract
+
+V2 cannot be called complete after isolated sentence tests.
+
+### 25.1 Protocol/schema tests
+
+- FinanceTurn;
+- every FinancePlan discriminant;
+- PlanPatch replace/clear/inherit semantics;
+- invalid additional properties;
+- money/currency;
+- date boundaries/timezone;
+- actor scope;
+- ReferenceSpec;
+- Result lifecycle.
+
+### 25.2 Full app-route tests
+
+Exercise the real `src/app.ts` equivalent V2 entry path for:
+
+- Telegram text;
+- Telegram photo/caption;
+- natural-language API;
+- structured read APIs;
+- explicit compatibility route;
+- Queue consumer.
+
+### 25.3 Model call-budget tests
+
+Assert:
+
+- ordinary turn: one interpretation authority;
+- no second parser on invalid output;
+- analysis optional prose is distinguishable from interpretation;
+- receipt provider/classifier calls are separately counted.
+
+### 25.4 Required dialogue matrix
+
+#### A. Query refinement
 
 ```text
 把上周六到今天的财务支出详细列出来
@@ -630,9 +1779,9 @@ Required scenario:
 → 这些一共多少
 ```
 
-Must retain one coherent task state.
+One coherent task state and immutable result references.
 
-### 17.3 Cross-operation continuity
+#### B. Cross-operation continuity
 
 ```text
 本月支出明细
@@ -641,212 +1790,339 @@ Must retain one coherent task state.
 → 撤销刚才这个修改
 ```
 
-### 17.4 Topic switch and return
+#### C. New task then return
 
 ```text
 本月支出明细
 → 只看烟酒
 → 午饭25元
-→ 那刚才烟酒一共多少
+→ 回到刚才烟酒那些
+→ 一共多少
 ```
 
-The system must distinguish a new create operation from the previously active query and still preserve an appropriate reference to the prior query.
+#### D. Pronouns/references
 
-### 17.5 Reference language
+Cover:
 
-Cover at least:
+- 这笔;
+- 那笔;
+- 上一笔;
+- 刚才两笔;
+- 第二笔;
+- 这些;
+- 上面那些;
+- 刚才删掉的;
+- 这张小票;
+- 第二项.
 
-- 这笔
-- 那笔
-- 上一笔
-- 刚才两笔
-- 第二笔
-- 这些
-- 上面那些
-- 刚才删掉的
-- 这张小票
-- 第二项
+#### E. Presentation
 
-### 17.6 Ambiguity
+- dates;
+- item only;
+- amount;
+- account/category;
+- sort;
+- grouping;
+- page changes;
+- compact/full.
 
-- multiple historical matches
-- model says singular but DB finds multiple
-- explicit two-record mutation
-- latest unrelated record must never be selected as an accidental fallback
+#### F. Topic/thread isolation
 
-### 17.7 Presentation
+Same chat, different Telegram topics must not share mutable context accidentally.
 
-- date on/off
-- selected fields
-- sort ascending/descending
-- page next/previous/specific
-- grouped result
-- compact/full
+### 25.5 Mutation safety
 
-### 17.8 Idempotency and ordering
+- zero/one/multiple candidate cases;
+- exact_count must match exactly;
+- stale ResultSet row;
+- row-version conflict;
+- update/delete/restore duplicate replay;
+- restore exact delete operation;
+- no mutation fall-through.
 
-- duplicated Telegram update for every mutation type
-- delayed older turn arriving after newer turn
-- concurrent messages
-- retry after timeout
+### 25.6 Idempotency/concurrency
 
-### 17.9 Failure injection
+- duplicate Telegram update;
+- same event concurrent delivery;
+- API timeout/retry;
+- Queue duplicate;
+- stale event;
+- session CAS conflict;
+- payload-hash conflict.
 
-- LLM timeout
-- malformed model JSON
-- D1 read failure
-- D1 write failure
-- second statement in batch failure
-- audit insert failure
-- renderer failure after successful mutation
+### 25.7 Stable ResultSet/pagination
 
-Mutation state must remain correct and observable.
+- equal timestamps;
+- inserts after page 1;
+- update after snapshot;
+- page token;
+- current page vs full result set;
+- ordinal reference remains deterministic.
 
-### 17.10 Time semantics
+### 25.8 Failure injection
 
-- Telegram delayed delivery
-- midnight boundary
-- timezone
-- relative date phrases
-- explicit historical date
+Inject failures at:
 
-### 17.11 Large result behavior
+- orchestrator timeout/invalid schema;
+- reference DB read;
+- policy;
+- operation reservation;
+- ledger write;
+- item write;
+- audit write;
+- session CAS;
+- ResultSet creation;
+- outbox creation;
+- render;
+- Telegram send;
+- Queue ack/retry;
+- receipt provider;
+- analysis prose call.
 
-- >10 rows
-- >100 rows summary
-- stable pagination
-- follow-up against current page vs full filtered set must be semantically explicit
+Prove no impossible partial terminal state.
 
-### 17.12 Receipt follow-up
+### 25.9 Receipt E2E
+
+- real/isolated provider path as appropriate;
+- reconciliation;
+- parent/items;
+- caption semantics;
+- item update;
+- receipt delete/restore;
+- duplicate Queue job;
+- send retry;
+- old-job drain compatibility.
+
+### 25.10 Migration/rollback E2E
+
+- fresh install;
+- 0007 -> V2 upgrade;
+- production-like copied data;
+- 0005 FK/hard-delete edge;
+- 0006 inactive categories;
+- old Worker + new additive schema;
+- new Worker + historical data;
+- route rollback after V2 committed operations;
+- migration failure/forward fix;
+- old Queue job during new deployment.
+
+### 25.11 Shadow/canary proof
+
+- shadow writes zero production state;
+- shadow sends zero user messages;
+- shadow calls no receipt provider;
+- V1 behavior unchanged by V2 divergence;
+- canary scope cannot leak to non-canary actor/session.
+
+### 25.12 Real external evidence
+
+Before production closeout, evidence distinguishes:
+
+- real Workers AI interpretation;
+- real D1;
+- real Queue;
+- real Telegram API response;
+- actual user-visible Telegram reply where required.
+
+Local mocks cannot be reported as those results.
+
+---
+
+## 26. Implementation module boundaries
+
+Final intended module ownership:
 
 ```text
-[receipt]
-→ 第二项改成日用品
-→ 这张小票一共多少
-→ 撤销这张小票
-→ 恢复刚才那张
+1. channel-adapters/
+   Telegram/API/Queue transport only.
+
+2. finance-turn/
+   turn identity, actor, ordering, idempotency ingress.
+
+3. finance-orchestrator/
+   the single natural-language understanding contract.
+
+4. finance-plan/
+   versioned Plan/PlanPatch/schema validation.
+
+5. finance-session/
+   turn log, plan store, session projection.
+
+6. finance-results/
+   immutable ResultSet/reference store.
+
+7. finance-reference/
+   deterministic catalog/entity/operation resolution.
+
+8. finance-safety/
+   authorization, ambiguity, cardinality, CAS, money/domain policy.
+
+9. finance-executor/
+   the only ledger read/write business executor.
+
+10. finance-operations/
+    operation identity, audit, idempotency, snapshots.
+
+11. finance-render/
+    deterministic renderers and bounded analysis prose adapter.
+
+12. finance-outbox/
+    durable delivery state/retry.
+
+13. receipt-extraction/
+    provider/OCR/resolver/reconciliation, no ledger writes.
+
+14. compatibility/
+    explicit legacy adapters only; never automatic fallback.
 ```
 
----
-
-## 18. Test architecture
-
-Add dedicated V2 suites instead of relying only on old isolated tests.
-
-Recommended groups:
-
-- `finance-orchestrator-schema.test.ts`
-- `finance-session.test.ts`
-- `finance-reference-resolution.test.ts`
-- `finance-safety-policy.test.ts`
-- `finance-executor.test.ts`
-- `finance-dialogue-e2e.test.ts`
-- `finance-telegram-e2e.test.ts`
-- `finance-shadow-comparison.test.ts`
-
-The dialogue E2E suite must run whole conversations with shared session state, not reset state between each sentence.
-
-Real Workers AI acceptance must include dialogue sequences, not only route matrices.
+The physical file layout may vary, but ownership/invariants may not.
 
 ---
 
-## 19. Architecture guard tests
+## 27. Implementation sequence
 
-Add tests/lint-like checks that make architectural regression visible.
+No implementation phase starts until this revised Blueprint is independently reviewed as `BLUEPRINT_READY`.
 
-At minimum:
+### Phase 0 - Architecture re-audit
 
-- production Telegram finance path invokes one orchestrator only
-- no destructive finance path invokes a second AI parser after orchestration
-- adapters contain no regex intent routing
-- all mutation execution goes through one safety policy
-- all finance mutations use common idempotency handling
+- audit this revision against current `main`;
+- require explicit pass/fail on all prior A-I findings;
+- no product-code changes.
 
-These tests protect the architecture itself, not only feature output.
+### Phase 1 - Protocol freeze
 
----
+Implement only schema/types/tests/migration design in isolated branch:
 
-## 20. Observability
+- FinanceTurn;
+- FinancePlan;
+- PlanPatch;
+- Reference;
+- Result;
+- operation/outbox states.
 
-Need structured, privacy-conscious trace metadata:
+No production route switch.
 
-- turn_id
-- orchestrator action
-- new_plan vs patch_plan
-- session version before/after
-- result status
-- resolved target count
-- mutation count
-- audit IDs
-- model call count
-- fallback/failure reason
+### Phase 2 - Persistence core
 
-Do not log raw secrets. Avoid logging full sensitive finance text unless explicitly needed for temporary controlled debugging.
+Implement:
 
-Model call count should be measurable so regressions such as duplicate parsing are detectable in production.
+- turn log;
+- plan store;
+- session projection;
+- ResultSet store;
+- operation/idempotency;
+- outbox;
+- migrations.
 
----
+Prove fresh/upgrade/rollback compatibility.
 
-## 21. Performance and cost
+### Phase 3 - Deterministic core
 
-The architecture should prefer one orchestration model call per text turn.
+Implement:
 
-Possible exceptions:
+- resolver;
+- safety;
+- executor;
+- renderer.
 
-- analysis prose generation after deterministic statistics
-- receipt extraction remains specialized
+Port reusable SQL/snapshot/reconciliation logic without importing legacy NLP authority.
 
-Do not call multiple LLM routers sequentially.
+### Phase 4 - Orchestrator
 
-Context passed to the model must be bounded and structured rather than dumping long conversation transcripts.
+Implement the one schema-constrained dialogue interpretation layer.
 
----
+No legacy fallback inside V2.
 
-## 22. Definition of done
+### Phase 5 - Receipt integration
 
-V2 cannot be called complete until all are true:
+Version receipt jobs and route validated extraction through V2 executor.
 
-1. One LLM natural-language authority in production finance path.
-2. One structured plan protocol.
-3. Durable multi-turn session state.
-4. Deterministic executor and centralized safety policy.
-5. Unified idempotency across create/update/delete/restore.
-6. Receipt follow-ups use same reference model.
-7. Old semantic routers are removed from production path or explicitly compatibility-only with no authority.
-8. Whole-dialogue acceptance matrix passes with real Workers AI + isolated D1.
-9. Shadow comparison has no unexplained high-risk divergence.
-10. Production canary passes.
-11. Real Telegram multi-turn scenarios pass.
-12. Rollback path is verified.
-13. Architecture guard tests pass.
+### Phase 6 - Full isolated E2E
 
-Passing single-sentence tests is explicitly insufficient.
+Complete dialogue, idempotency, concurrency, failure, migration, receipt suites.
 
----
+### Phase 7 - Shadow
 
-## 23. Scope discipline after V2
+Strict read-only/sampled interpretation shadow under the shadow contract.
 
-After V2 cutover, normal feature additions should fit one of these extension points:
+### Phase 8 - Canary
 
-- add fields/operators to FinancePlan
-- add deterministic executor capability
-- add renderer capability
-- add analysis capability based on FinanceResult
-- add adapter/channel
+Controlled actor/session scope.
 
-A request that appears to require a new parallel NLP layer is a signal to stop and review the architecture, not to immediately add one.
+### Phase 9 - Primary V2
+
+V2 is the only default natural-language finance route.
+
+### Phase 10 - Legacy retirement
+
+After evidence window and rollback independence, remove old semantic authorities.
 
 ---
 
-## 24. Immediate next step
+## 28. Production rollback runbook requirements
 
-Before any implementation:
+Before canary, a concrete runbook must exist and be tested.
 
-1. Hermes audits current `main` against this blueprint.
-2. Produce a path-by-path inventory of all finance entry points and fallbacks.
-3. Mark every current component as `reuse`, `adapt`, `compatibility-only`, or `remove-after-cutover`.
-4. Identify migration constraints and production rollout risks.
-5. Return contradictions or missing cases to ChatGPT.
-6. No product code changes during this audit.
+It must specify:
 
-Only after this architecture audit is accepted should implementation begin.
+1. exact flag to move `canary/v2 -> v1`;
+2. whether new V2 events are accepted during rollback;
+3. how pending outbox is handled;
+4. how in-progress operations are allowed to settle/replay;
+5. how receipt producer/consumer versions are switched;
+6. how old Queue jobs are drained;
+7. why old Worker remains compatible with additive schema;
+8. how valid V2 ledger mutations remain visible;
+9. how a proven defective V2 mutation is compensated with audit;
+10. who/what determines rollback success.
+
+“Deploy the old Worker” alone is not an acceptable rollback plan.
+
+---
+
+## 29. Definition of BLUEPRINT_READY
+
+Architecture audit may return `BLUEPRINT_READY` only if it finds no unresolved design blocker in these categories:
+
+- single LLM semantic authority;
+- FinanceTurn identity/ordering/actor scope;
+- complete Plan/PlanPatch semantics;
+- long-lived multi-turn session model;
+- immutable result/reference model;
+- exact mutation cardinality;
+- all-operation idempotency;
+- receipt through the same write core;
+- atomic operation/audit/session/result/outbox boundary;
+- delivery retry independent of ledger execution;
+- structured API and natural-language API boundary;
+- shadow has no production side effects;
+- migration/old Worker/Queue compatibility;
+- executable route rollback;
+- cutover/legacy deletion gates;
+- observability;
+- realistic full-dialogue/concurrency/failure/E2E acceptance.
+
+`BLUEPRINT_READY` does **not** mean product code is finished. It means implementation can begin without knowingly carrying an architecture-level blocker.
+
+---
+
+## 30. Definition of V2 completion
+
+V2 may be called production-complete only when all are true:
+
+1. primary natural-language finance traffic uses one orchestrator;
+2. no automatic semantic fallback to Command/Conversation/regex/legacy;
+3. create/query/summarize/analyze/compare/update/delete/restore pass the full route;
+4. multi-turn dialogue matrix passes;
+5. result references/pagination are stable;
+6. all mutations and receipt creation are idempotent;
+7. receipt follow-up references work;
+8. operation/audit/session/result/outbox states are coherent under failure;
+9. migration + rollback evidence passes;
+10. shadow/canary/full-cutover evidence passes;
+11. actual Telegram user-visible behavior is verified;
+12. legacy semantic paths are compatibility-only or removed according to cutover gate;
+13. architecture guards prevent reintroduction of a second semantic authority.
+
+This definition intentionally prevents a handful of sentence tests from being reported as “彻底完成”.
