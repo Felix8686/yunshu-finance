@@ -13,6 +13,16 @@
 
 这个结论只表示“可以进入后续 Phase 1 实现评审”，不表示 V2 产品代码已经实现，也不表示 0008/0009 已在生产执行或线上 V2 已可用。按照交接边界，本轮在架构复审通过后停止，不修改 `main`、不部署、不写远程 D1/R2/Queue。
 
+## 后续实现状态更正（2026-09-08）
+
+上面的结论是 2026-09-07 架构复审时的历史状态。复审通过后，隔离分支 `codex/finance-orchestrator-v2-rev4-closeout` 已完成本地实现检查点 `06faf21`：
+
+- 0008/0009 已纳入分支并通过本地 D1 migrations 验证；
+- FinanceTurn、FinancePlan/PlanPatch、统一 Orchestrator、fenced Executor、ResultSet/分页、FinanceResult、Renderer、Outbox 和 receipt V3 已接入 `src/app.ts`；
+- API structured 路径已通过本地 HTTP 验证，Telegram webhook 的 owner 鉴权、倒序 update 拒绝和 168 小时 epoch reset 已通过本地验证；
+- `npm run typecheck`、`npm test`、本地迁移检查和 `wrangler deploy --dry-run` 已通过；
+- 以上均是隔离、本地或 dry-run 证据，不代表生产已迁移、部署或切换。
+
 ## 已闭合问题
 
 ### 1. 当前运行时 route fence
@@ -60,12 +70,14 @@ Rev4 明确要求部署账户为 **Workers Paid**。Cloudflare 官方文档当�
 - `git diff --check`：PASS（仅有 Git 的 LF/CRLF 提示）；
 - 本分支只修改/新增架构文档，不包含产品代码、生产配置或密钥。
 
-## 尚未完成、因此不能宣称“整个系统已可用”
+## 尚未完成、因此不能宣称“生产整个系统已可用”
 
-1. V2 Phase 1 产品实现尚未开始；当前生产基线仍是 V1。
-2. 0008/0009 尚未授权或执行到生产 D1；本地 SQLite 验证不等于 Cloudflare 线上迁移成功。
-3. Workers Paid 账户方案、远程 D1/R2/Queue、V2 Worker 部署和线上 Telegram E2E 尚未在本轮验证。
-4. 进入 Phase 1 后仍需实现规范中的 runtime validator、route-fence helper、outbox sender、迁移脚本和真实运行时测试，再进行独立实现复审。
+1. 当前生产基线和远程资源仍未切换；0008/0009 尚未写入生产 D1，V2 Worker 尚未部署。
+2. Workers Paid 账户、远程 D1/R2/Queue 绑定、生产 secret、实际 Telegram 用户可见消息和 receipt provider E2E 尚未验证。
+3. 完整对话矩阵、并发/故障注入、shadow structural comparison、canary/cutover、rollback/re-enable 证据尚未完成。
+4. legacy finance semantic paths 仍保留为 compatibility 路径，尚未达到删除或永久隔离的 cutover gate。
+
+可执行的本地/上线前步骤见 `docs/FINANCE_ORCHESTRATOR_V2_IMPLEMENTATION_RUNBOOK_20260907.md`；生产迁移和切换仍须遵守 `docs/FINANCE_ORCHESTRATOR_V2_MIGRATION_RUNBOOK_REV4.md`。
 
 ## 官方容量/语义来源
 
