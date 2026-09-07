@@ -244,6 +244,32 @@ function addDays(date: string, delta: number): string {
   return d.toISOString().slice(0, 10);
 }
 
+function normalizeMutationTargetForSafety(command: FinanceCommand, text: string): FinanceCommand {
+  if (command.action !== 'update' && command.action !== 'delete') return command;
+
+  const target = { ...command.target };
+  if (text.includes('昨天')) {
+    target.scope = 'yesterday';
+  } else if (text.includes('今天')) {
+    target.scope = 'today';
+  } else if (
+    target.scope === 'latest'
+    && !/(刚才|刚刚|上一笔|上笔|最近一笔|最后一笔)/.test(text)
+  ) {
+    // “那笔/这笔”本身不能授权程序把任意最新流水当成目标。
+    // 若模型没有提取出更具体的目标条件，matched 会让歧义保护拒绝猜测。
+    target.scope = 'matched';
+  }
+
+  return { ...command, target };
+}
+
+function isAmbiguousMutation(command: FinanceCommand, rows: TransactionRow[]): boolean {
+  return command.target.count === 0
+    && command.target.scope !== 'latest'
+    && rows.length > 1;
+}
+
 async function classifyFinanceCommand(
   env: Env,
   text: string,
@@ -270,6 +296,10 @@ async function classifyFinanceCommand(
             'create 规则：一句话中不同事项各自有明确金额时，拆成多条 transactions；不得把不同分类拼成一个 category_name；不得猜分摊金额。',
             '如果用户只给出“烟和抽纸一共28.9”而无法知道各自金额，不要猜；返回 passthrough 或低 confidence。',
             'target.scope：latest=上一笔/刚才那一笔；recent=刚才几笔；today/yesterday；date_range=明确日期范围；matched=按分类/金额/商家/文本等条件匹配。',
+            '用户明确说“今天/昨天”等时间锚点时，时间锚点优先于“那笔/这笔”等指代。例如“昨天买烟的那笔”必须 scope=yesterday，绝不能 scope=latest。',
+            'latest 只能用于明确的“刚才/刚刚/上一笔/最近一笔/最后一笔”等最近流水表达；“那笔/这笔”本身不能触发 latest。',
+            'update/delete 的 target 必须保留用户用于定位旧流水的全部条件；能映射为分类/账户/商家/金额就填结构化字段，否则把足以定位的原始短语放进 target.text。不要把 changes 中的新值误当成 target 条件。',
+            '如果描述不足以唯一定位 update/delete 目标，不得擅自选择最新一笔；保持 count=0 并让 target 覆盖所有候选，由程序执行歧义保护。',
             '用户明确说“刚才两笔/最近3笔”时填 count；latest 默认 count=1；未明确数量的 matched 填 count=0。',
             'target 只描述如何寻找真实流水，绝不能编造 transaction id。',
             'changes 只填写用户明确要求修改的字段；未修改字段必须用空字符串或 0。',
@@ -559,7 +589,7 @@ async function executeDelete(
 ): Promise<FinanceCommandResult> {
   const rows = await resolveTargets(env, command, referenceLocalNow, true);
   if (!rows.length) return { action: 'delete', reply: '没有找到符合条件的账目，没有执行删除。' };
-  if (command.target.scope === 'matched' && command.target.count === 0 && rows.length > 1) {
+  if (isAmbiguousMutation(command, rows)) {
     return { action: 'delete', reply: `找到 ${rows.length > 20 ? '20+' : rows.length} 笔可能匹配的账目。请再说明金额、时间、分类或数量，我不会猜着删除。` };
   }
 
@@ -593,7 +623,7 @@ async function executeUpdate(
   if (!hasChanges(command)) return { action: 'update', reply: '我理解你想修改账目，但没有识别到具体要改成什么。' };
   const rows = await resolveTargets(env, command, referenceLocalNow, true);
   if (!rows.length) return { action: 'update', reply: '没有找到符合条件的账目，没有执行修改。' };
-  if (command.target.scope === 'matched' && command.target.count === 0 && rows.length > 1) {
+  if (isAmbiguousMutation(command, rows)) {
     return { action: 'update', reply: `找到 ${rows.length > 20 ? '20+' : rows.length} 笔可能匹配的账目。请再说明具体是哪一笔，我不会猜着修改。` };
   }
   const selected = command.target.count > 0 ? rows.slice(0, command.target.count) : rows.slice(0, 1);
@@ -772,8 +802,9 @@ export async function handleFinanceCommandTelegram(
   sourceId: string,
   referenceLocalNow: string
 ): Promise<FinanceCommandResult | null> {
-  const command = await classifyFinanceCommand(env, text, referenceLocalNow);
-  if (!command || command.confidence < 0.6 || command.action === 'passthrough') return null;
+  const classified = await classifyFinanceCommand(env, text, referenceLocalNow);
+  if (!classified || classified.confidence < 0.6 || classified.action === 'passthrough') return null;
+  const command = normalizeMutationTargetForSafety(classified, text);
 
   if (command.action === 'create') return executeCreate(env, command, source, sourceId, text, referenceLocalNow);
   if (command.action === 'query') return executeQuery(env, command, referenceLocalNow, false);
