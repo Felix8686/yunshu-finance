@@ -22,7 +22,7 @@ export type OutboxMode = 'paused' | 'enabled' | 'draining';
 export interface FinanceActor {
   schema_version: typeof FINANCE_SCHEMA_VERSION;
   ledger_scope_id: typeof LEDGER_SCOPE_ID;
-  subject_id: 'telegram:owner' | 'api:owner' | 'system:receipt';
+  subject_id: string;
   auth_source: 'telegram_owner' | 'api_owner' | 'system_receipt';
   permissions: Array<'finance:read' | 'finance:write' | 'finance:receipt'>;
 }
@@ -186,16 +186,28 @@ export interface CreatePlan extends PlanBase {
   entries: CreateEntry[];
 }
 
+export interface ReceiptCreatePlan extends PlanBase {
+  operation: 'receipt_create';
+  receipt_job_id: string;
+  receipt_artifact_id: string;
+  receipt_merchant?: string | null;
+  receipt_total_fen?: number;
+  receipt_item_count?: number;
+  entries: CreateEntry[];
+}
+
 export interface QueryPlan extends PlanBase {
   operation: 'query';
   filters: FinanceFilters;
   temporal_scope?: TemporalScope | null;
+  reference?: ReferenceSpec | null;
 }
 
 export interface SummarizePlan extends PlanBase {
   operation: 'summarize';
   filters: FinanceFilters;
   temporal_scope?: TemporalScope | null;
+  reference?: ReferenceSpec | null;
 }
 
 export interface AnalyzePlan extends PlanBase {
@@ -204,6 +216,7 @@ export interface AnalyzePlan extends PlanBase {
   temporal_scope?: TemporalScope | null;
   metric: 'expense' | 'income' | 'net' | 'count' | 'category_share' | 'account_share' | 'trend';
   dimension: 'none' | 'date' | 'category' | 'account' | 'merchant';
+  reference?: ReferenceSpec | null;
 }
 
 export interface ComparePlan extends PlanBase {
@@ -213,6 +226,7 @@ export interface ComparePlan extends PlanBase {
   filters: FinanceFilters;
   metric: 'expense' | 'income' | 'net' | 'count' | 'category_share' | 'account_share';
   dimension: 'none' | 'date' | 'category' | 'account' | 'merchant';
+  reference?: ReferenceSpec | null;
 }
 
 export interface UpdatePlan extends PlanBase {
@@ -235,6 +249,7 @@ export interface RestorePlan extends PlanBase {
 
 export type FinancePlan =
   | CreatePlan
+  | ReceiptCreatePlan
   | QueryPlan
   | SummarizePlan
   | AnalyzePlan
@@ -243,14 +258,28 @@ export type FinancePlan =
   | DeletePlan
   | RestorePlan;
 
-export type PlanPatch = {
+export type PlanPatchComponent<T> =
+  | { op: 'replace'; value: T }
+  | { op: 'clear' };
+
+export type PlanOperationPatch = {
+  op: 'replace';
+  value: FinanceOperationType;
+};
+
+export interface PlanPatch {
   schema_version: typeof FINANCE_SCHEMA_VERSION;
   base_plan_id: string;
   base_plan_version: number;
   base_session_version: number;
-  operation?: 'replace' | 'clear' | 'inherit';
-  value?: unknown;
-};
+  operation?: PlanOperationPatch;
+  temporal_scope?: PlanPatchComponent<TemporalScope>;
+  filters?: PlanPatchComponent<FinanceFilters>;
+  selection?: PlanPatchComponent<FinanceSelection>;
+  changes?: PlanPatchComponent<FinanceChanges>;
+  presentation?: PlanPatchComponent<FinancePresentation>;
+  reference?: PlanPatchComponent<ReferenceSpec>;
+}
 
 export interface TransactionItemSnapshot {
   id: string;
@@ -289,6 +318,17 @@ export interface FinanceSummary {
   net_fen: number;
 }
 
+export interface FinancePage {
+  result_set_id: string;
+  result_set_version: number;
+  start_ordinal: number;
+  end_ordinal: number;
+  page_size: number;
+  has_previous: boolean;
+  has_next: boolean;
+  next_page_token?: string | null;
+}
+
 export interface FinanceError {
   code: string;
   safe_message: string;
@@ -309,6 +349,11 @@ export interface FinanceSuccessBase {
   summary?: FinanceSummary | null;
   analysis_data?: Record<string, unknown> | null;
   comparison_data?: Record<string, unknown> | null;
+  page?: FinancePage | null;
+  receipt_artifact_id?: string | null;
+  receipt_merchant?: string | null;
+  receipt_total_fen?: number | null;
+  receipt_item_count?: number | null;
 }
 
 export type FinanceMutationSuccessResult = FinanceSuccessBase & {
@@ -596,9 +641,8 @@ export function assertRouteWitness(witness: RouteWitness): void {
     }
     return;
   }
-  if (MUTATION_OPERATIONS.has(witness.operation_type as FinanceMutationOperation) &&
-      witness.finance_route_mode !== 'canary_v2' && witness.finance_route_mode !== 'primary_v2') {
-    throw new ProtocolValidationError('route_not_allowed', 'finance V2 mutation route is not enabled');
+  if (witness.finance_route_mode !== 'canary_v2' && witness.finance_route_mode !== 'primary_v2') {
+    throw new ProtocolValidationError('route_not_allowed', 'finance V2 route is not enabled');
   }
 }
 
@@ -609,12 +653,21 @@ export function assertRuntimeControl(control: RuntimeControl): void {
   if (!Number.isInteger(control.config_epoch) || control.config_epoch < 1) {
     throw new ProtocolValidationError('invalid_config_epoch', 'config epoch must be a positive integer');
   }
+  if (!['primary_v1', 'shadow_v2', 'canary_v2', 'draining_v2', 'primary_v2'].includes(control.finance_route_mode)) {
+    throw new ProtocolValidationError('invalid_runtime_control', 'invalid finance route mode');
+  }
+  if (!['v1', 'draining_v1', 'v2', 'draining_v2'].includes(control.receipt_route_mode)) {
+    throw new ProtocolValidationError('invalid_runtime_control', 'invalid receipt route mode');
+  }
+  if (!['paused', 'enabled', 'draining'].includes(control.outbox_mode) || !['off', 'interpretation_only'].includes(control.shadow_mode)) {
+    throw new ProtocolValidationError('invalid_runtime_control', 'invalid runtime route state');
+  }
   if (control.analysis_prose_enabled !== 0 && control.analysis_prose_enabled !== 1) {
     throw new ProtocolValidationError('invalid_runtime_control', 'analysis prose flag must be 0 or 1');
   }
 }
 
-async function sha256Hex(value: string): Promise<string> {
+export async function sha256Hex(value: string): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
 }

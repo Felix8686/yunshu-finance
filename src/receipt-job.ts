@@ -15,6 +15,7 @@ import type {
 
 export interface ReceiptQueueJob {
   chatId: number;
+  threadId?: number | null;
   messageId: number;
   updateId: number;
   photo: TelegramPhotoSize;

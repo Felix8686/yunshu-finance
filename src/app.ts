@@ -14,6 +14,13 @@ import {
   rememberFinanceContext
 } from './finance-conversation';
 import { handleFinanceCommandTelegram } from './finance-command';
+import { handleFinanceV2ApiRequest } from './finance-v2/http';
+import { dispatchFinanceOutbox } from './finance-v2/outbox';
+import { readRuntimeControl } from './finance-v2/persistence';
+import { handleFinanceV2Turn } from './finance-v2/service';
+import { buildTelegramFinanceTurn } from './finance-v2/turn';
+import { interpretFinanceTurn } from './finance-v2/orchestrator';
+import { processReceiptQueueJobV3 } from './receipt-job-v3';
 import { resolveTelegramReferenceTime, telegramMessageDateToDate } from './telegram-time';
 import type { Env, TelegramUpdate } from './types';
 import type { ReceiptQueueJob } from './receipt-job';
@@ -53,6 +60,17 @@ async function sendTelegramMessageSafely(env: Env, chatId: number, text: string)
   }
 }
 
+function telegramOwnerAuthorized(env: Env, update: TelegramUpdate): boolean {
+  const expectedUserId = env.TELEGRAM_OWNER_USER_ID?.trim();
+  const expectedChatId = env.TELEGRAM_OWNER_CHAT_ID?.trim();
+  if (!expectedUserId || !expectedChatId) return false;
+  const message = update.message;
+  if (!message?.from?.id || !message.chat?.id) return false;
+  if (String(message.from.id) !== expectedUserId || String(message.chat.id) !== expectedChatId) return false;
+  const expectedChatType = env.TELEGRAM_OWNER_CHAT_TYPE?.trim();
+  return !expectedChatType || message.chat.type === expectedChatType;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -76,6 +94,9 @@ export default {
         d1_bound: !!env.DB
       });
     }
+
+    const financeV2Response = await handleFinanceV2ApiRequest(request, env);
+    if (financeV2Response) return financeV2Response;
 
     const financeApiResponse = await handleFinanceApiRequest(request, env);
     if (financeApiResponse) return financeApiResponse;
@@ -109,6 +130,65 @@ export default {
     const chatId = update.message?.chat?.id;
     const text = update.message?.text?.trim();
     const telegramSourceId = `tg_${update.message?.message_id || update.update_id}`;
+
+    let financeV2TelegramActive = false;
+    let financeV2TelegramShadow = false;
+    let receiptV2TelegramActive = false;
+    try {
+      const runtime = await readRuntimeControl(env.DB);
+      financeV2TelegramActive = ['canary_v2', 'primary_v2'].includes(runtime.finance_route_mode);
+      financeV2TelegramShadow = runtime.finance_route_mode === 'shadow_v2';
+      receiptV2TelegramActive = ['v2', 'draining_v2'].includes(runtime.receipt_route_mode);
+    } catch {
+      financeV2TelegramActive = false;
+      receiptV2TelegramActive = false;
+    }
+
+    if ((financeV2TelegramActive || financeV2TelegramShadow || receiptV2TelegramActive) && !telegramOwnerAuthorized(env, update)) {
+      if (!env.TELEGRAM_OWNER_USER_ID || !env.TELEGRAM_OWNER_CHAT_ID) {
+        return jsonResponse({ ok: false, error: 'TELEGRAM_OWNER_NOT_CONFIGURED' }, 503);
+      }
+      return jsonResponse({ ok: false, error: 'FORBIDDEN' }, 403);
+    }
+
+    if (chatId && text && !update.message?.photo?.length && financeV2TelegramShadow) {
+      try {
+        const turn = await buildTelegramFinanceTurn(update, 'Asia/Shanghai', new Date(), env.TELEGRAM_OWNER_USER_ID);
+        if (turn) {
+          const shadowPlan = await interpretFinanceTurn(env, turn, {
+            sessionVersion: 0,
+            activePlan: null,
+            recentTurnSummaries: []
+          });
+          console.info('finance v2 shadow interpretation', JSON.stringify({ operation: shadowPlan.operation, confidence: shadowPlan.confidence }));
+        }
+      } catch (error) {
+        console.warn('finance v2 shadow interpretation failed', error instanceof Error ? error.message : 'unknown error');
+      }
+    }
+
+    if (chatId && text && !update.message?.photo?.length && financeV2TelegramActive) {
+      try {
+        const turn = await buildTelegramFinanceTurn(update, 'Asia/Shanghai', new Date(), env.TELEGRAM_OWNER_USER_ID);
+        if (!turn) return jsonResponse({ ok: true, ignored: true });
+        const response = await handleFinanceV2Turn(env, turn, {
+          telegramDestinationId: String(chatId),
+          telegramThreadId: update.message?.message_thread_id ? String(update.message.message_thread_id) : null
+        });
+        const isError = response.result.kind === 'error' || response.result.kind === 'rejected';
+        return jsonResponse({
+          ok: !isError,
+          finance_v2: true,
+          operation_id: response.operation_id,
+          duplicate: response.duplicate || false,
+          in_progress: response.in_progress || false,
+          result: response.result
+        }, response.in_progress ? 409 : isError ? 422 : 200);
+      } catch (error) {
+        console.error('telegram finance v2 failed', error instanceof Error ? error.message : 'unknown error');
+        return jsonResponse({ ok: false, finance_v2: true, error: 'FINANCE_V2_FAILED' }, 500);
+      }
+    }
 
     if (chatId && text) {
       try {
@@ -176,6 +256,7 @@ export default {
 
     const job: ReceiptQueueJob = {
       chatId,
+      threadId: update.message?.message_thread_id || null,
       messageId,
       updateId: update.update_id,
       photo,
@@ -200,13 +281,26 @@ export default {
     for (const message of batch.messages) {
       const job = message.body;
       try {
-        const result = await processReceiptQueueJobV2(env, job);
-        await sendTelegramMessage(env, job.chatId, result.message);
+        let useFinanceV2Receipt = false;
+        try {
+          const runtime = await readRuntimeControl(env.DB);
+          useFinanceV2Receipt = runtime.receipt_route_mode === 'v2';
+        } catch {
+          useFinanceV2Receipt = false;
+        }
+        const result = useFinanceV2Receipt
+          ? await processReceiptQueueJobV3(env, job)
+          : await processReceiptQueueJobV2(env, job);
+        if (!result.viaOutbox) await sendTelegramMessage(env, job.chatId, result.message);
         message.ack();
       } catch (error) {
         console.error('receipt queue job failed', error instanceof Error ? error.message : 'unknown error');
         message.retry();
       }
     }
+  },
+
+  async scheduled(_controller: unknown, env: Env): Promise<void> {
+    await dispatchFinanceOutbox(env, 10);
   }
 };

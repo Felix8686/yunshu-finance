@@ -59,6 +59,10 @@ export interface Env {
   API_BEARER_TOKEN?: string;
   TELEGRAM_BOT_TOKEN?: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
+  TELEGRAM_OWNER_USER_ID?: string;
+  TELEGRAM_OWNER_CHAT_ID?: string;
+  TELEGRAM_OWNER_CHAT_TYPE?: string;
+  FINANCE_PAGE_TOKEN_SECRET?: string;
 }
 
 export type IntakeIntent = 'create_transaction' | 'spending_today' | 'unknown';
@@ -103,7 +107,9 @@ export interface TelegramUpdate {
   message?: {
     message_id: number;
     date?: number;
-    chat: { id: number };
+    chat: { id: number; type?: string };
+    from?: { id: number };
+    message_thread_id?: number;
     text?: string;
     caption?: string;
     photo?: TelegramPhotoSize[];
@@ -169,6 +175,7 @@ export interface ReceiptProcessResult {
   transactionId?: string;
   duplicate?: boolean;
   itemCount?: number;
+  viaOutbox?: boolean;
 }
 
 export interface SyncFileRecord {

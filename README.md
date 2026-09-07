@@ -24,4 +24,4 @@ Cloudflare-first 的个人万象库云端化项目。
 - Queues
 - Cron Triggers
 
-项目目前处于架构与 MVP 初始化阶段。
+Finance Orchestrator V2 已进入隔离工作树实现验证阶段：本地协议、D1 迁移、统一执行核心、ResultSet/分页、Outbox、receipt V3 和 runtime route fence 已接入；生产迁移、部署、Telegram 真实账号 E2E 和全量 cutover 仍需按实现运行手册逐项验收。
