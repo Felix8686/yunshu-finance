@@ -805,25 +805,50 @@
       }
     },
     "FinanceSuccessResult": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["schema_version", "kind", "result_id", "turn_id", "operation", "ledger_scope_id", "commit_status", "render_hash"],
-      "properties": {
-        "schema_version": {"const": 2},
-        "kind": {"const": "success"},
-        "result_id": {"$ref": "#/$defs/IdString"},
-        "turn_id": {"$ref": "#/$defs/IdString"},
-        "operation": {"enum": ["create", "query", "summarize", "analyze", "compare", "update", "delete", "restore", "receipt_create"]},
-        "ledger_scope_id": {"const": "personal:primary"},
-        "commit_status": {"enum": ["not_required", "committed"]},
-        "render_hash": {"$ref": "#/$defs/Hash64"},
-        "transaction_ids": {"type": "array", "items": {"$ref": "#/$defs/IdString"}, "maxItems": 50},
-        "result_set_id": {"type": ["string", "null"], "maxLength": 128},
-        "rows": {"type": "array", "items": {"$ref": "#/$defs/FinanceResultRow"}, "maxItems": 20},
-        "summary": {"anyOf": [{"$ref": "#/$defs/FinanceSummary"}, {"type": "null"}]},
-        "analysis_data": {"anyOf": [{"$ref": "#/$defs/FinanceAnalysisData"}, {"type": "null"}]},
-        "comparison_data": {"anyOf": [{"$ref": "#/$defs/FinanceComparisonData"}, {"type": "null"}]}
-      }
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema_version", "kind", "result_id", "turn_id", "operation", "ledger_scope_id", "commit_status", "render_hash"],
+          "properties": {
+            "schema_version": {"const": 2},
+            "kind": {"const": "success"},
+            "result_id": {"$ref": "#/$defs/IdString"},
+            "turn_id": {"$ref": "#/$defs/IdString"},
+            "operation": {"enum": ["create", "update", "delete", "restore", "receipt_create"]},
+            "ledger_scope_id": {"const": "personal:primary"},
+            "commit_status": {"const": "committed"},
+            "render_hash": {"$ref": "#/$defs/Hash64"},
+            "transaction_ids": {"type": "array", "items": {"$ref": "#/$defs/IdString"}, "maxItems": 50},
+            "result_set_id": {"type": ["string", "null"], "maxLength": 128},
+            "rows": {"type": "array", "items": {"$ref": "#/$defs/FinanceResultRow"}, "maxItems": 20},
+            "summary": {"anyOf": [{"$ref": "#/$defs/FinanceSummary"}, {"type": "null"}]},
+            "analysis_data": {"anyOf": [{"$ref": "#/$defs/FinanceAnalysisData"}, {"type": "null"}]},
+            "comparison_data": {"anyOf": [{"$ref": "#/$defs/FinanceComparisonData"}, {"type": "null"}]}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema_version", "kind", "result_id", "turn_id", "operation", "ledger_scope_id", "commit_status", "render_hash"],
+          "properties": {
+            "schema_version": {"const": 2},
+            "kind": {"const": "success"},
+            "result_id": {"$ref": "#/$defs/IdString"},
+            "turn_id": {"$ref": "#/$defs/IdString"},
+            "operation": {"enum": ["query", "summarize", "analyze", "compare"]},
+            "ledger_scope_id": {"const": "personal:primary"},
+            "commit_status": {"const": "not_required"},
+            "render_hash": {"$ref": "#/$defs/Hash64"},
+            "transaction_ids": {"type": "array", "items": {"$ref": "#/$defs/IdString"}, "maxItems": 50},
+            "result_set_id": {"type": ["string", "null"], "maxLength": 128},
+            "rows": {"type": "array", "items": {"$ref": "#/$defs/FinanceResultRow"}, "maxItems": 20},
+            "summary": {"anyOf": [{"$ref": "#/$defs/FinanceSummary"}, {"type": "null"}]},
+            "analysis_data": {"anyOf": [{"$ref": "#/$defs/FinanceAnalysisData"}, {"type": "null"}]},
+            "comparison_data": {"anyOf": [{"$ref": "#/$defs/FinanceComparisonData"}, {"type": "null"}]}
+          }
+        }
+      ]
     },
     "FinanceClarificationResult": {
       "type": "object",
@@ -914,7 +939,7 @@
         "entity_id": {"$ref": "#/$defs/IdString"},
         "entity_fingerprint": {"$ref": "#/$defs/Hash64"},
         "row_snapshot_json": {"type": "string", "minLength": 2, "maxLength": 8192},
-        "row_snapshot_bytes": {"type": "integer", "minimum": 2, "maximum": 8192}
+        "row_snapshot_bytes": {"type": "integer", "minimum": 2, "maximum": 8192, "$comment": "Derived by the shared resultset-canonical-v1 UTF-8 validator; a caller-declared mismatch is rejected."}
       }
     },
     "ResultSetSnapshot": {
@@ -930,7 +955,7 @@
         "row_count": {"type": "integer", "minimum": 0, "maximum": 200},
         "page_size": {"type": "integer", "minimum": 1, "maximum": 20},
         "sort_filter_fingerprint": {"$ref": "#/$defs/Hash64"},
-        "snapshot_bytes": {"type": "integer", "minimum": 0, "maximum": 262144},
+        "snapshot_bytes": {"type": "integer", "minimum": 0, "maximum": 262144, "$comment": "Derived from the canonical ordered item array by the shared resultset-canonical-v1 UTF-8 validator; a caller-declared mismatch is rejected."},
         "items": {"type": "array", "items": {"$ref": "#/$defs/ResultSetItemSnapshot"}, "maxItems": 200},
         "created_at": {"type": "string", "format": "date-time"},
         "expires_at": {"type": "string", "format": "date-time"}
@@ -998,12 +1023,13 @@
     "FinanceOutboxRecord": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema_version", "outbox_id", "ledger_scope_id", "result_id", "part_index", "render_hash", "destination_type", "destination_id", "status", "lease_epoch", "attempt_count"],
+      "required": ["schema_version", "outbox_id", "ledger_scope_id", "result_id", "delivery_request_id", "part_index", "render_hash", "destination_type", "destination_id", "status", "lease_epoch", "attempt_count", "route_epoch"],
       "properties": {
         "schema_version": {"const": 2},
         "outbox_id": {"$ref": "#/$defs/IdString"},
         "ledger_scope_id": {"const": "personal:primary"},
         "result_id": {"$ref": "#/$defs/IdString"},
+        "delivery_request_id": {"$ref": "#/$defs/IdString"},
         "part_index": {"type": "integer", "minimum": 0, "maximum": 15},
         "render_hash": {"$ref": "#/$defs/Hash64"},
         "destination_type": {"const": "telegram_owner"},
@@ -1013,6 +1039,7 @@
         "lease_owner": {"type": ["string", "null"], "maxLength": 128},
         "lease_epoch": {"type": "integer", "minimum": 0},
         "lease_expires_at": {"type": ["string", "null"], "format": "date-time"},
+        "route_epoch": {"type": "integer", "minimum": 1},
         "attempt_count": {"type": "integer", "minimum": 0, "maximum": 5},
         "next_attempt_at": {"type": ["string", "null"], "format": "date-time"},
         "telegram_message_id": {"type": ["integer", "null"], "minimum": 1}

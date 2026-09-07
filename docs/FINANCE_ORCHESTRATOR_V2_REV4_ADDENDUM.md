@@ -142,14 +142,36 @@ WHERE EXISTS (
     AND status = 'executing'
     AND lease_epoch = ?
     AND route_epoch = ?
+    AND EXISTS (
+      SELECT 1
+      FROM finance_runtime_control
+      WHERE control_id = 'primary'
+        AND config_epoch = ?
+        AND (
+          (finance_operations.operation_type <> 'receipt_create'
+            AND finance_route_mode IN ('canary_v2', 'primary_v2'))
+          OR
+          (finance_operations.operation_type = 'receipt_create'
+            AND receipt_route_mode = 'v2')
+        )
+    )
 );
 ```
 
 For update/delete statements, include the equivalent `EXISTS` predicate.
 
-The terminal operation update is the final statement in the D1 batch and must match the same operation ID + lease epoch + route epoch + `status='executing'`.
+The terminal operation update is the final statement in the D1 batch and must match the same operation ID + lease epoch + route epoch + `status='executing'` **and** the current runtime-control `config_epoch` plus the operation-type-specific route mode. A statement must not read a cached mode from the Worker as proof of route ownership.
 
 The Worker treats a mutation as committed only when the terminal operation update reports exactly one changed row. If the fence is stale, every guarded statement is a no-op and the caller returns/reloads the newer operation state. A stale owner may never convert a no-op batch into success.
+
+The route witness is mandatory for every side-effect statement, not only the terminal statement:
+
+- ordinary finance operations require `finance_runtime_control.config_epoch = finance_operations.route_epoch` and `finance_route_mode IN ('canary_v2', 'primary_v2')`;
+- `receipt_create` requires the same epoch equality and `receipt_route_mode = 'v2'`;
+- an operation reserved before a transition to `draining_*` is stale after the transition, because the transition increments `config_epoch`; `draining_*` never authorizes an old route epoch to commit;
+- a stale route/lease no-op returns a typed `stale_fence` / `rollout_interrupted` outcome and is never rendered as a successful mutation.
+
+The required isolated race is: Worker A reserves at epoch N, runtime control transitions to epoch N+1, A resumes with its old lease and route epoch, every guarded side-effect statement changes zero rows, and the terminal update changes zero rows. The test must cover `draining_v2`, `primary_v1`, and receipt `draining_v2` transitions.
 
 This fencing rule is also an architecture-guard target: direct ledger writes without the operation-fence helper are forbidden in primary V2.
 
@@ -172,7 +194,7 @@ updated_at
 
 Every transition increments `config_epoch`.
 
-A V2 mutation reservation stores the current `config_epoch` as `route_epoch`. The final mutation batch is fenced by that route epoch as described in R4.4. Therefore a Worker instance that cached an obsolete rollout state cannot commit a V2 mutation after rollback/cutover changes the epoch.
+A V2 mutation reservation stores the current `config_epoch` as `route_epoch`. Every guarded statement then joins the **current** `finance_runtime_control` row and requires `config_epoch = route_epoch` plus the route mode allowed for that operation type. Comparing only `finance_operations.route_epoch` with a Worker-supplied value is insufficient: the operation row preserves historical state and does not prove that the current route still authorizes the write. Therefore a Worker instance that cached an obsolete rollout state cannot commit a V2 mutation after rollback/cutover changes the epoch.
 
 A pre-V2 binary that does not understand this control row is never a normal rollback target once V2 write canary begins. Rollback uses a V2-capable binary with V1 compatibility paths behind the runtime state machine.
 
@@ -190,6 +212,8 @@ Hard limits:
 - `RESULTSET_TTL_HOURS = 24`
 
 A ResultSet has one immutable ordered full bounded set plus mutable session window pointers.
+
+`row_snapshot_bytes`, `snapshot_bytes`, `row_count`, item ordinals, and the item cardinality are derived invariants, not caller assertions. Every writer and every decoder MUST use the same `resultset-canonical-v1` validator: canonicalize each row JSON, encode it as UTF-8, recompute the row byte length, canonicalize the ordered item array, recompute the aggregate snapshot byte length, and verify `row_count == items.length` and ordinals are exactly `1..row_count`. A supplied byte count that does not equal the recomputed value is rejected before persistence or reference resolution. The schema fields document the wire contract; the shared runtime validator owns the byte calculation because JSON Schema cannot calculate UTF-8 byte length.
 
 `finance_result_sets` owns:
 
@@ -293,6 +317,7 @@ To avoid dual payload ownership, outbox does not store a second full message bod
 outbox_id
 ledger_scope_id
 result_id
+delivery_request_id
 part_index
 render_hash
 destination_type
@@ -302,21 +327,25 @@ status
 lease_owner
 lease_epoch
 lease_expires_at
+route_epoch
 attempt_count
 last_attempt_started_at
 telegram_message_id
-provider_response_json
 last_error_code
 next_attempt_at
 created_at
 accepted_at
 ```
 
-Outbox part identity is deterministic from `(result_id, part_index)`.
+`delivery_request_id` identifies one user-visible delivery request. The initial delivery derives a deterministic ID from the immutable result, destination, and initial delivery turn. An explicit replay derives a different deterministic ID from the same result, destination, and replay turn/idempotency key. All parts of one request share the same `delivery_request_id`.
 
-Sender claim/reclaim increments `lease_epoch`.
+Outbox part identity is `(delivery_request_id, part_index)`. The same immutable `FinanceResult` may therefore have multiple historical delivery attempts without changing or deleting earlier `accepted` or `unknown` evidence. Repeating the same replay turn/idempotency key resolves to the existing delivery request and cannot create another one.
 
-Terminal sender updates (`accepted`, `failed_retryable`, `failed_terminal`, `unknown`) require matching `outbox_id + lease_owner + lease_epoch + status='sending'`.
+Sender claim/reclaim reads the current `finance_runtime_control` row in the same guarded transaction. A due `pending`/`failed_retryable` row may be claimed only when `outbox_mode IN ('enabled', 'draining')`; the claim atomically increments `lease_epoch` **and** rebinds `finance_outbox.route_epoch` to the current `config_epoch`. The terminal update then matches that newly stored route epoch. An in-flight sender keeps its old route epoch and is fenced after a transition; a later eligible claim can adopt the new epoch. `unknown` is never implicitly re-bound or resent.
+
+Terminal sender updates (`accepted`, `failed_retryable`, `failed_terminal`, `unknown`) require matching `outbox_id + lease_owner + lease_epoch + route_epoch + status='sending'` and a current runtime-control witness: `config_epoch = finance_outbox.route_epoch` and `outbox_mode IN ('enabled', 'draining')`. A transition to `paused` fences the old sender; a new explicit replay is allowed only after delivery is enabled again.
+
+The outbox never stores a raw provider response body or a second message body. Persisted delivery evidence is limited to the typed status, Telegram message ID, accepted timestamp, bounded error code, attempt timestamps, and lease metadata.
 
 Rules:
 
@@ -369,6 +398,8 @@ Receipt parent delete/restore audit snapshot includes the exact ordered child se
 
 Revision 4 corrects an important terminology issue from the re-audit: Cloudflare's approximately 5,000 "bindings per Workers script" refers to resource bindings, not SQL bound parameters. It is not an SQL batch-parameter budget.
 
+The V2 atomic bounds require **Workers Paid**. Cloudflare's current D1 limits document 1,000 queries per Worker invocation on Paid and 50 on Free, while the V2 receipt/multi-create/result-set bounds can require more than the Free invocation budget even when each individual statement is valid. Free is therefore not a supported deployment target for V2; deployment preflight must verify the account plan and fail closed rather than silently reducing the atomic product contract. The exact plan prerequisite and this acceptance gate are part of the migration runbook.
+
 Relevant D1 bounds remain per-query maximum 100 bound parameters, per-statement maximum 100 KB SQL text, and maximum 30 seconds for the whole batch call.
 
 V2 therefore uses explicit product-level bounds:
@@ -377,7 +408,7 @@ V2 therefore uses explicit product-level bounds:
 - `MAX_RECEIPT_ITEMS = 64`
 - `MAX_TOTAL_CREATE_ITEMS = 100`
 - `MAX_MUTATION_TARGETS = 50`
-- `MAX_D1_BATCH_STATEMENTS = 256`
+- `MAX_D1_BATCH_STATEMENTS = 256` (Workers Paid prerequisite; measured invocation headroom remains a release gate)
 - `MAX_RESULT_SET_ROWS = 200`
 - `MAX_RESULTSET_ROW_SNAPSHOT_BYTES = 8 KiB`
 - `MAX_RESULTSET_SNAPSHOT_BYTES = 256 KiB`
@@ -389,6 +420,8 @@ V2 therefore uses explicit product-level bounds:
 Before executor commit, code computes entry count, total receipt/item count, estimated statement count, canonical snapshot bytes, render bytes/parts, and per-statement parameter count. If any bound would be exceeded, return typed `operation_too_large` / `result_too_large` before any mutation.
 
 An operation is never split into multiple non-atomic D1 batches while claiming to be one atomic mutation.
+
+Capacity source checked for this revision: Cloudflare D1 Limits and D1 Database API documentation (current check: 2026-09-07). The deployment gate must re-check the live account plan before enabling V2.
 
 ## R4.11 Shadow comparison is structural only
 
@@ -423,10 +456,11 @@ It cannot be used as evidence that V1 and V2 selected the same live rows, calcul
 - express PlanPatch with explicit `replace`/`clear`, where omission means inherit;
 - include OrchestratorOutput;
 - include immutable FinanceResult without delivery/replay state;
-- include bounded typed ResultSet/window/page-token structures;
+- constrain FinanceSuccessResult so mutation operations require `commit_status='committed'` and read operations require `commit_status='not_required'`;
+- include bounded typed ResultSet/window/page-token structures with the shared `resultset-canonical-v1` byte/cardinality validator;
 - include ReceiptJob/ProviderAttempt/Artifact/Envelope;
 - include FinanceOperationRecord with lease epoch/route epoch;
-- include FinanceOutboxRecord with sender lease epoch and no duplicated message body;
+- include FinanceOutboxRecord with sender lease epoch, route epoch, explicit `delivery_request_id`, and no raw provider response or duplicated message body;
 - include TurnContextSnapshot and RuntimeControl;
 - use `additionalProperties:false` for protocol envelopes;
 - version persisted/wire contracts.
@@ -461,6 +495,10 @@ Revision 3 guard strategy remains valid and is extended:
 - outbox sender cannot import renderer or ledger query helpers;
 - result replay cannot import live ledger query helpers;
 - runtime tests assert one natural-language semantic authority, zero second-parser calls, committed duplicate zero mutation SQL, stale lease owner zero ledger changes, expired sending -> unknown, and receipt late completion does not replace active plan.
+- runtime tests assert stale current-control epoch/mode produces zero changes for mutation, receipt, and outbox terminal statements;
+- runtime tests assert explicit replay creates a new delivery request while repeating the same replay idempotency key is a no-op;
+- runtime tests assert raw provider response bodies are not accepted by outbox persistence;
+- deployment guards reject a Workers Free account for the declared V2 atomic bounds.
 
 The implementation remains lightweight: TypeScript compiler API + normal tests; no separate static-analysis service.
 

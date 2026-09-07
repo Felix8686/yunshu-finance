@@ -13,7 +13,10 @@ Production baseline at architecture freeze: `main` = `b707ddb8a5c627ceb0677c1677
 5. Rollback means route-state rollback inside a V2-capable binary; committed V2 ledger mutations remain valid history.
 6. Queue/outbox/provider external side effects are never treated as part of a D1 transaction.
 7. Every runtime state transition increments `config_epoch`.
-8. Every V2 mutation stores that epoch as `route_epoch`; the final mutation batch is fenced by operation `lease_epoch` and runtime `config_epoch`.
+8. Every V2 mutation stores that epoch as `route_epoch`; every protected side-effect statement and terminal update must fence operation `lease_epoch` **and** the current runtime-control `config_epoch` plus the operation-specific allowed route mode.
+9. V2's declared atomic bounds require a Workers Paid deployment. A Free-plan account is not an acceptable fallback target because its D1 per-invocation query limit is 50, below the worst-case V2 operation budget.
+
+The rollout preflight must record the Cloudflare account plan and fail closed unless it is Workers Paid. It must not claim that the `MAX_D1_BATCH_STATEMENTS = 256` contract works on Free, and it must not silently lower product bounds during deployment.
 
 ## 2. Proposed 0008 — V2 state/control tables
 
@@ -134,7 +137,7 @@ CREATE TABLE IF NOT EXISTS finance_result_set_items (
   entity_id TEXT NOT NULL,
   entity_fingerprint TEXT NOT NULL,
   row_snapshot_json TEXT NOT NULL,
-  row_snapshot_bytes INTEGER NOT NULL CHECK (row_snapshot_bytes >= 0 AND row_snapshot_bytes <= 8192),
+  row_snapshot_bytes INTEGER NOT NULL CHECK (row_snapshot_bytes >= 2 AND row_snapshot_bytes <= 8192),
   PRIMARY KEY (result_set_id, ordinal),
   FOREIGN KEY (result_set_id) REFERENCES finance_result_sets(result_set_id) ON DELETE CASCADE
 );
@@ -221,6 +224,7 @@ CREATE TABLE IF NOT EXISTS finance_outbox (
   outbox_id TEXT PRIMARY KEY,
   ledger_scope_id TEXT NOT NULL,
   result_id TEXT NOT NULL,
+  delivery_request_id TEXT NOT NULL,
   part_index INTEGER NOT NULL CHECK (part_index >= 0 AND part_index < 16),
   render_hash TEXT NOT NULL,
   destination_type TEXT NOT NULL CHECK (destination_type = 'telegram_owner'),
@@ -232,15 +236,15 @@ CREATE TABLE IF NOT EXISTS finance_outbox (
   lease_owner TEXT,
   lease_epoch INTEGER NOT NULL DEFAULT 0 CHECK (lease_epoch >= 0),
   lease_expires_at TEXT,
+  route_epoch INTEGER NOT NULL CHECK (route_epoch >= 1),
   attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0 AND attempt_count <= 5),
   last_attempt_started_at TEXT,
   telegram_message_id INTEGER,
-  provider_response_json TEXT,
   last_error_code TEXT,
   next_attempt_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   accepted_at TEXT,
-  UNIQUE (result_id, part_index, destination_id),
+  UNIQUE (ledger_scope_id, delivery_request_id, part_index),
   FOREIGN KEY (result_id) REFERENCES finance_results(result_id)
 );
 
@@ -313,11 +317,17 @@ Must pass:
 - existing 0001-0007 DB apply 0008;
 - all indexes/constraints introspected after apply;
 - duplicate scoped idempotency rejected;
-- duplicate result/outbox part rejected;
+- duplicate `(delivery_request_id, part_index)` rejected;
+- the same immutable `result_id` can create a second outbox delivery request only with a different explicit replay identity;
+- repeating the same replay turn/idempotency key resolves to the existing delivery request and creates no additional rows;
+- a post-transition claim rebinds an eligible pending/retryable outbox row to the current route epoch, while an in-flight old-epoch sender remains fenced;
+- raw provider response bodies cannot be persisted in outbox delivery metadata;
 - operation lease epoch CAS/reclaim isolated tests;
 - `finance_result_sets.snapshot_bytes > 262144` rejected;
 - `row_snapshot_bytes > 8192` rejected;
+- result-set writers recompute canonical UTF-8 row/snapshot bytes, row count, and ordinals instead of trusting caller-declared values;
 - runtime-control invalid enum combinations rejected by application state transition validator;
+- runtime route witness rejects stale `config_epoch` and disallowed route mode for operation, receipt, and outbox terminal statements;
 - `git diff --check`, typecheck, dry-run.
 
 ## 3. Proposed 0009 — preserve immutable recovery identity
@@ -405,6 +415,8 @@ canary_v2 | primary_v2
 
 `draining_v2` accepts no new V2 mutation reservations.
 
+Because entering `draining_v2` increments `config_epoch`, an operation reserved under the previous epoch cannot complete a ledger mutation: every side-effect statement and its terminal update must observe the current epoch and an allowed `canary_v2|primary_v2` mode. The same rule applies when the route is already `primary_v1`.
+
 ### 4.2 Receipt route
 
 ```text
@@ -414,6 +426,8 @@ v2 -> draining_v2 -> v1
 
 `draining_*` accepts no new receipt enqueue for the route being drained.
 
+Receipt artifact/provider completion is also fenced by the current control epoch and `receipt_route_mode = 'v2'`; a stale V2 job cannot publish after `draining_v2` or `v1` becomes current.
+
 ### 4.3 Outbox route
 
 ```text
@@ -422,7 +436,7 @@ paused <-> enabled
 enabled -> draining -> paused
 ```
 
-`draining` creates no new delivery attempts except already committed pending/confirmed-retryable rows.
+`draining` creates no new explicit replay requests. It may claim already committed `pending`/`failed_retryable` rows under the new current route epoch; the claim must atomically read the current control row, increment `lease_epoch`, and rebind `finance_outbox.route_epoch` to that current `config_epoch`. Their terminal update must observe `config_epoch = finance_outbox.route_epoch` plus `outbox_mode IN ('enabled','draining')`. A sender claimed before a transition is fenced when the epoch changes, while `unknown` is never implicitly re-bound or resent.
 
 ### 4.4 Shadow
 
@@ -435,10 +449,11 @@ enabled -> draining -> paused
 3. Deploy a V2-capable binary while runtime control remains `primary_v1 / receipt=v1 / outbox=paused / shadow=off`.
 4. Verify V1 behavior is unchanged and V2 primary route is unreachable.
 5. Verify the V2-capable binary reads `finance_runtime_control` and owner settings.
-6. Verify pre-V2 binaries are no longer part of the normal rollback procedure.
-7. Only then enable `shadow_v2` if shadow acceptance has passed.
+6. Verify the Cloudflare account is Workers Paid and record the plan evidence alongside the capacity gate.
+7. Verify pre-V2 binaries are no longer part of the normal rollback procedure.
+8. Only then enable `shadow_v2` if shadow acceptance has passed.
 
-No V2 mutation canary is allowed before steps 1-7 pass.
+No V2 mutation canary is allowed before steps 1-8 pass.
 
 ## 6. V1 -> V2 finance cutover
 
@@ -448,7 +463,7 @@ No V2 mutation canary is allowed before steps 1-7 pass.
 4. Canary is capability-scoped, not random per-turn traffic splitting.
 5. A capability routed to V2 has no automatic semantic fallback to V1.
 6. Before each V2 mutation reservation, read current config epoch/mode.
-7. Final mutation batch is fenced by operation lease epoch + route epoch.
+7. Every mutation statement and final operation update is fenced by operation lease epoch + stored route epoch + current control config epoch + operation-specific allowed mode.
 8. After canary evidence window, `canary_v2 -> primary_v2`.
 
 ## 7. Finance semantic rollback
@@ -458,7 +473,7 @@ Use this when interpretation/executor/session/reference behavior is defective bu
 1. transition `canary_v2|primary_v2 -> draining_v2`; increment config epoch;
 2. stop new V2 mutation reservations immediately;
 3. wait at least one operation lease horizon;
-4. any old Worker completion with stale `route_epoch` or `lease_epoch` becomes a fenced no-op;
+4. any old Worker completion with stale `route_epoch`, `lease_epoch`, current `config_epoch`, or route mode becomes a fenced no-op;
 5. reclaim expired uncommitted operations only for terminal settlement; do not execute a new mutation during rollback drain;
 6. mark unrecoverable uncommitted operations `failed_terminal` with `rollout_interrupted` result;
 7. require query evidence: zero `reserved/executing` operations with an active lease;
@@ -489,6 +504,8 @@ Use this when Telegram/outbox delivery is defective while ledger semantics are h
 6. fix/validate sender;
 7. resume `enabled` or `draining` explicitly.
 
+An explicit replay after this rollback creates a new `delivery_request_id` only after `outbox_mode = enabled`; it references the existing immutable `FinanceResult` and never edits/deletes the previous `unknown` row.
+
 Ledger route need not be rolled back solely because Telegram delivery is paused if the product explicitly accepts delayed confirmations during the maintenance window; otherwise finance mutation intake must also be paused by product policy.
 
 ## 9. Receipt V1 -> V2 cutover
@@ -510,7 +527,7 @@ This is a drain, not dual semantic consumption.
 
 1. set `receipt_route_mode = draining_v2`; stop new V2 receipt intake;
 2. wait for V2 jobs/provider attempts to settle or lease-expire;
-3. stale provider completions cannot publish artifacts because artifact persistence is fenced by job lease epoch/route epoch;
+3. stale provider completions cannot publish artifacts because artifact persistence is fenced by job lease epoch/route epoch plus the current runtime `config_epoch` and `receipt_route_mode`;
 4. require zero active V2 receipt job leases;
 5. settle committed-result outbox rows according to delivery policy;
 6. switch consumer deployment back to V1 compatibility consumer inside the V2-capable binary;
@@ -537,9 +554,11 @@ The implementation must provide read-only operational queries/scripts for at lea
 
 ```text
 runtime control row + config epoch
+Cloudflare account plan evidence = Workers Paid
 count active reserved/executing operation leases
 count expired reclaimable operation leases
 count pending/failed_retryable/sending/unknown outbox by age
+delivery request history for one result, including explicit replay attempts
 count receipt jobs by status + active lease
 count provider attempts by status
 old Queue backlog / retry / dead-letter evidence
@@ -558,9 +577,13 @@ Overall migration/rollback is PASS only when all are demonstrated without produc
 - 0005 original identity survives delete;
 - receipt child cascade + V2 exact child audit snapshot;
 - old schema data readable by V2-capable Worker;
+- Workers Paid plan prerequisite verified for the deployed account;
 - `primary_v1` mode preserves V1 behavior;
-- route epoch prevents stale deployment mutation commit;
+- current runtime config epoch and route mode prevent stale deployment mutation, receipt artifact, and outbox terminal commits;
 - operation lease epoch prevents stale owner commit;
+- canonical result-set validator rejects forged UTF-8 byte/cardinality declarations;
+- explicit replay creates a new delivery request without editing historical `accepted`/`unknown` rows, and replay idempotency prevents duplicates;
+- outbox persistence rejects raw provider response bodies;
 - pending/unknown outbox survives semantic rollback;
 - V1->V2 and V2->V1 receipt drain;
 - rollback followed by re-canary/re-enable V2;
