@@ -13,6 +13,7 @@ import {
   handleFinanceConversationTelegram,
   rememberFinanceContext
 } from './finance-conversation';
+import { handleFinanceCommandTelegram } from './finance-command';
 import { resolveTelegramReferenceTime, telegramMessageDateToDate } from './telegram-time';
 import type { Env, TelegramUpdate } from './types';
 import type { ReceiptQueueJob } from './receipt-job';
@@ -48,7 +49,7 @@ async function sendTelegramMessageSafely(env: Env, chatId: number, text: string)
   try {
     await sendTelegramMessage(env, chatId, text);
   } catch (error) {
-    console.error('telegram receipt reply failed', error instanceof Error ? error.message : 'unknown error');
+    console.error('telegram reply failed', error instanceof Error ? error.message : 'unknown error');
   }
 }
 
@@ -61,13 +62,14 @@ export default {
       return jsonResponse({
         ok: true,
         service: 'wanxiang-cloud',
-        version: '0.6.0',
+        version: '0.7.0',
         receipt_vision: true,
         receipt_provider: 'veryfi',
         receipt_provider_configured: isVeryfiConfigured(env),
         receipt_queue_bound: !!env.RECEIPT_QUEUE,
         finance_history_query: true,
         finance_conversation: true,
+        finance_command_layer: true,
         dynamic_finance_taxonomy: true,
         telegram_event_time: true,
         r2_bound: !!env.FILES,
@@ -103,9 +105,34 @@ export default {
 
     const timeZone = env.APP_TIMEZONE || 'Asia/Shanghai';
     const eventDate = telegramMessageDateToDate(update.message?.date) || new Date();
+    const referenceLocalNow = resolveTelegramReferenceTime(update.message?.date, timeZone);
     const chatId = update.message?.chat?.id;
     const text = update.message?.text?.trim();
+    const telegramSourceId = `tg_${update.message?.message_id || update.update_id}`;
+
     if (chatId && text) {
+      try {
+        const commandResult = await handleFinanceCommandTelegram(
+          env,
+          text,
+          'telegram',
+          telegramSourceId,
+          referenceLocalNow
+        );
+        if (commandResult) {
+          await sendTelegramMessageSafely(env, chatId, commandResult.reply);
+          return jsonResponse({
+            ok: true,
+            finance_command: true,
+            action: commandResult.action
+          });
+        }
+      } catch (error) {
+        console.error('telegram finance command failed', error instanceof Error ? error.message : 'unknown error');
+        await sendTelegramMessageSafely(env, chatId, '账本操作失败，没有继续执行修改。请稍后重试。');
+        return jsonResponse({ ok: false, error: 'FINANCE_COMMAND_FAILED' }, 500);
+      }
+
       try {
         const conversation = await handleFinanceConversationTelegram(env, String(chatId), text, eventDate);
         if (conversation) {
@@ -153,7 +180,7 @@ export default {
       updateId: update.update_id,
       photo,
       caption: update.message?.caption?.trim() || '',
-      localNow: resolveTelegramReferenceTime(update.message?.date, timeZone)
+      localNow: referenceLocalNow
     };
 
     const enqueueResult = await enqueueReceiptJob(env, job);
