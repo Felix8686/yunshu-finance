@@ -14,7 +14,8 @@ Topology
 - D1 is local and isolated under a fresh --persist-to directory.
 - R2/Queue remain local.
 - AI inference is real Cloudflare Workers AI, but transported through a temporary localhost REST bridge instead of env.AI remote binding.
-- The bridge uses the same Cloudflare REST endpoint and Wrangler OAuth credential mechanism already proven by tests/real-workers-ai.test.ts.
+- The bridge uses the same Cloudflare REST endpoint as tests/real-workers-ai.test.ts.
+- Authentication MUST come from `npx wrangler auth token --json`, not by reading `oauth_token` directly from Wrangler's TOML. Wrangler refreshes expired OAuth credentials when this command is used.
 - No production resource is modified.
 
 Safety
@@ -23,8 +24,18 @@ Safety
 - Never use production D1/R2/Queue.
 - Never modify main.
 - Temporary bridge/wrapper/config/SQL must stay untracked and be deleted after testing.
-- Never print or persist the OAuth token in reports, Git, shell history where avoidable, or test artifacts.
+- Never print or persist the auth token in reports, Git, shell history where avoidable, or test artifacts.
 - The bridge must bind to 127.0.0.1 only.
+
+Step 0 - validate current Cloudflare authentication
+Before creating the bridge:
+1. Run `npx wrangler auth token --json`.
+2. Do NOT print or report the token value. Record only whether a token was returned and the credential type (`oauth` or `api_token`).
+3. Run a one-request Workers AI REST probe using that returned token against the configured account/model.
+4. If the probe succeeds, continue.
+5. If Wrangler reports no usable credentials, run `npx wrangler whoami`. If the session is logged out or OAuth cannot refresh, perform `npx wrangler login` and then repeat steps 1-3.
+6. If credential type is `api_token` and Cloudflare returns authentication/permission error, verify that this API token has Account > Workers AI permissions. Do not broaden permissions beyond what the Workers AI REST call requires.
+7. Do not fall back to reading `oauth_token` directly from `default.toml`; that value can be an expired access token even while Wrangler still has a usable refresh token.
 
 Step 1 - temporary host-side Workers AI REST bridge
 Create an untracked Node script outside the repository or under an ignored temp directory.
@@ -32,13 +43,14 @@ Create an untracked Node script outside the repository or under an ignored temp 
 The bridge must:
 - listen only on 127.0.0.1 on a dedicated port, e.g. 8792;
 - accept POST /run with JSON `{ model, input }`;
-- read the existing Wrangler OAuth token at runtime using the same source already proven by tests/real-workers-ai.test.ts;
+- obtain the current auth token at bridge startup via `npx wrangler auth token --json`;
+- never read `oauth_token` directly from Wrangler's TOML;
 - use account id `ffda4d04feec5de2ef3fb4fbbe35b496`;
 - forward the request to `https://api.cloudflare.com/client/v4/accounts/<account-id>/ai/run/<model>`;
-- use the same working curl/proxy path already proven by tests/real-workers-ai.test.ts (`http://127.0.0.1:7892`) if direct Node fetch is unreliable;
+- use the same working curl/proxy path (`http://127.0.0.1:7892`) if direct Node fetch is unreliable;
 - return only the Cloudflare `result` on success;
 - return a non-2xx response on Cloudflare API failure;
-- never log the OAuth token.
+- never log the auth token.
 
 First prove the bridge independently with one known real Workers AI command call before starting the Worker.
 
@@ -150,7 +162,7 @@ Retain the existing proofs:
 
 Step 13 - interpretation of AI transport
 This v2 test deliberately separates two concerns:
-1. Real model correctness: already proven separately with direct Cloudflare Workers AI REST calls and the required 10-input matrix.
+1. Real model correctness: proven separately with direct Cloudflare Workers AI REST calls and the required 10-input matrix.
 2. Real Worker/D1 integration correctness: proven here using the same real model over a localhost REST transport shim.
 
 Do not fail the product merely because Wrangler's AI remote-binding transport is broken on this machine if both layers above pass independently and together through the shim.
