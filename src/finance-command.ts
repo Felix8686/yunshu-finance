@@ -244,14 +244,22 @@ function addDays(date: string, delta: number): string {
   return d.toISOString().slice(0, 10);
 }
 
+function hasExplicitMultiMutationCount(text: string): boolean {
+  return /(?:[2-9]\d*|1\d+|[二两三四五六七八九十百]+)\s*(?:笔|条)(?:账|记录)?/.test(text);
+}
+
 function normalizeMutationTargetForSafety(command: FinanceCommand, text: string): FinanceCommand {
   if (command.action !== 'update' && command.action !== 'delete') return command;
 
   const target = { ...command.target };
+  const explicitMultiCount = hasExplicitMultiMutationCount(text);
+
   if (text.includes('昨天')) {
     target.scope = 'yesterday';
+    if (!explicitMultiCount) target.count = 0;
   } else if (text.includes('今天')) {
     target.scope = 'today';
+    if (!explicitMultiCount) target.count = 0;
   } else if (
     target.scope === 'latest'
     && !/(刚才|刚刚|上一笔|上笔|最近一笔|最后一笔)/.test(text)
@@ -259,6 +267,7 @@ function normalizeMutationTargetForSafety(command: FinanceCommand, text: string)
     // “那笔/这笔”本身不能授权程序把任意最新流水当成目标。
     // 若模型没有提取出更具体的目标条件，matched 会让歧义保护拒绝猜测。
     target.scope = 'matched';
+    target.count = 0;
   }
 
   return { ...command, target };
@@ -299,7 +308,7 @@ async function classifyFinanceCommand(
             '用户明确说“今天/昨天”等时间锚点时，时间锚点优先于“那笔/这笔”等指代。例如“昨天买烟的那笔”必须 scope=yesterday，绝不能 scope=latest。',
             'latest 只能用于明确的“刚才/刚刚/上一笔/最近一笔/最后一笔”等最近流水表达；“那笔/这笔”本身不能触发 latest。',
             'update/delete 的 target 必须保留用户用于定位旧流水的全部条件；能映射为分类/账户/商家/金额就填结构化字段，否则把足以定位的原始短语放进 target.text。不要把 changes 中的新值误当成 target 条件。',
-            '如果描述不足以唯一定位 update/delete 目标，不得擅自选择最新一笔；保持 count=0 并让 target 覆盖所有候选，由程序执行歧义保护。',
+            '如果描述不足以唯一定位 update/delete 目标，不得擅自选择最新一笔；保持 count=0 并让 target 覆盖所有候选，由程序执行歧义保护。单数“那笔/这笔”不等于显式 count=1。',
             '用户明确说“刚才两笔/最近3笔”时填 count；latest 默认 count=1；未明确数量的 matched 填 count=0。',
             'target 只描述如何寻找真实流水，绝不能编造 transaction id。',
             'changes 只填写用户明确要求修改的字段；未修改字段必须用空字符串或 0。',
