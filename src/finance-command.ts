@@ -256,9 +256,11 @@ function normalizeMutationTargetForSafety(command: FinanceCommand, text: string)
 
   if (text.includes('昨天')) {
     target.scope = 'yesterday';
+    if (target.text) target.text = target.text.replace(/昨天|今天|的那笔|那笔|这笔/g, '').trim();
     if (!explicitMultiCount) target.count = 0;
   } else if (text.includes('今天')) {
     target.scope = 'today';
+    if (target.text) target.text = target.text.replace(/昨天|今天|的那笔|那笔|这笔/g, '').trim();
     if (!explicitMultiCount) target.count = 0;
   } else if (
     target.scope === 'latest'
