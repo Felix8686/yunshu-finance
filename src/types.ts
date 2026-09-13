@@ -150,8 +150,9 @@ export function validateFinanceCommand(value: unknown): FinanceCommand {
     if (reportType === "compare" && compareRange === null) {
       throw new Error("compare report requires compare_range");
     }
-    const requestedLimit = Number(value.limit ?? 50);
-    const limit = Number.isInteger(requestedLimit) ? Math.min(100, Math.max(1, requestedLimit)) : 50;
+    const rawLimit = value.limit ?? 50;
+    if (!Number.isInteger(rawLimit)) throw new Error("limit must be an integer");
+    const limit = Math.min(100, Math.max(1, rawLimit as number));
     return {
       action: "report",
       report_type: reportType as "summary" | "details" | "category_breakdown" | "compare",
