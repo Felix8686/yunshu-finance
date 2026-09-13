@@ -1,0 +1,12 @@
+name = "yunshu-finance"
+main = "src/index.ts"
+compatibility_date = "2026-09-13"
+
+[vars]
+APP_TIMEZONE = "Asia/Shanghai"
+DEEPSEEK_MODEL = "deepseek-chat"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "yunshu-finance"
+database_id = "a5cec163-b1fe-474e-8c69-96b9aa5d933c"
