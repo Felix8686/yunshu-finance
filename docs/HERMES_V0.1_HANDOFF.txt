@@ -1,0 +1,83 @@
+云枢 v0.1 Hermes 执行交接
+
+仓库：Felix8686/yunshu-finance
+目标分支：dev/v0.1
+禁止直接修改 main。
+禁止复制旧 wanxiang-cloud 的业务代码、路由器、parser、fallback 或历史兼容层。
+
+目标
+
+验证并部署一个最小财务系统：Telegram -> DeepSeek -> FinanceCommand JSON -> 固定代码 -> Cloudflare D1 -> Telegram。
+
+架构铁律
+
+DeepSeek 是唯一自然语言理解入口。
+代码只做字段校验、固定 SQL、写入、查询、汇总和 Telegram I/O。
+D1 是唯一财务事实来源。
+禁止让模型生成或执行 SQL。
+禁止新增关键词路由、正则意图识别、第二套 parser、Orchestrator 或语义 fallback。
+
+阶段 A：本地静态验收
+
+1. 拉取仓库并切换 dev/v0.1。
+2. 安装依赖。
+3. 执行 npm run typecheck。
+4. 检查 wrangler.toml、migrations/0001_init.sql、src/types.ts、src/deepseek.ts、src/db.ts、src/index.ts。
+5. 如果 typecheck 失败，只在 dev/v0.1 修复，不改 main。
+
+验收条件：TypeScript 0 error；没有第二套自然语言解析逻辑；没有模型生成 SQL；没有 Secret 写入仓库。
+
+阶段 B：Cloudflare 开发资源
+
+1. 确认当前 Cloudflare 账号，不复用或修改旧万象生产 D1。
+2. 新建独立 D1 数据库，名称 yunshu-finance。
+3. 将新数据库 ID 写入 dev/v0.1 的 wrangler.toml 后提交到该分支。D1 ID 不是 Secret。
+4. 对新 D1 应用 migrations/0001_init.sql。
+5. 配置以下 Cloudflare Secrets，不把值写入 Git：
+   DEEPSEEK_API_KEY
+   TELEGRAM_BOT_TOKEN
+   TELEGRAM_SECRET_TOKEN
+   OWNER_TELEGRAM_ID
+6. APP_TIMEZONE 保持 Asia/Shanghai；DEEPSEEK_MODEL 默认 deepseek-chat。
+
+如果缺少任何 Secret，停止在该步骤并向用户报告缺少项，不猜测、不从旧万象读取生产 Secret。
+
+阶段 C：部署和真实 E2E
+
+1. 部署 dev/v0.1 当前代码到 Cloudflare Worker。
+2. 检查 GET /health 返回 ok=true、service=yunshu-finance、version=0.1.0。
+3. 将 Telegram webhook 指向 /telegram/webhook，并使用 TELEGRAM_SECRET_TOKEN。
+4. 用真实 Telegram 依次测试：
+   午饭18，支付宝
+   一盒烟15，一个打火机3块，现金
+   上个月的账单
+   这个月总共花了多少
+   看看本周各类花费
+   第二季度总账
+   第二季度和第一季度比一下
+   撤销刚才那次记账
+5. 对每条请求记录：DeepSeek 原始 JSON 指令（不得记录 API Key）、最终 D1 变化、Telegram 回复。
+6. 重放同一 Telegram update，确认不会重复记账。
+7. 直接查询 D1 核对金额、日期、分类、账户和汇总结果。
+
+失败处理
+
+任何测试失败时，先定位属于哪一层：DeepSeek JSON、协议校验、D1 执行、Telegram I/O。
+不得为了让单条测试通过而新增关键词补丁或第二套 parser。
+如果 DeepSeek 对同一句话输出错误，优先修改唯一 system prompt 或 FinanceCommand 协议，再重新跑完整核心用例。
+
+完成标准
+
+A. 8 条核心用例全部 PASS。
+B. 多笔记账拆分正确。
+C. 周/月/季度查询均来自同一 report 日期范围执行路径。
+D. 同一 update 重放不重复写入。
+E. D1 与 Telegram 回复金额一致。
+F. 无旧万象业务代码和兼容逻辑。
+G. main 未修改。
+
+完成后
+
+把所有必要修复提交并推送到 dev/v0.1。
+建立或更新 Draft PR 指向 main，但不要合并。
+最终只向用户汇报：Overall PASS/FAIL、分支 HEAD、部署 Worker、D1 名称、8 条用例结果、失败点（如有）、是否可以进入 ChatGPT 复审。
