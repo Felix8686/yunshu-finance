@@ -1,4 +1,4 @@
-import { createTransactions, runReport, undoLatestTransactionGroup, type ReportResult, type SummaryResult } from "./db";
+import { createTransactions, isUpdateProcessed, runReport, undoLatestTransactionGroup, type ReportResult, type SummaryResult } from "./db";
 import { interpretFinanceCommand } from "./deepseek";
 import type { Env, FinanceCommand } from "./types";
 
@@ -119,6 +119,13 @@ async function handleText(env: Env, update: TelegramUpdate): Promise<void> {
     return;
   }
 
+  // Deterministic replay guard: a redelivered update must never reach the
+  // interpreter again, so state-changing actions execute exactly once.
+  if (await isUpdateProcessed(env.DB, chatId, messageId)) {
+    await sendTelegram(env, chatId, "这条消息已经处理过，没有重复执行。", messageId);
+    return;
+  }
+
   const timeZone = env.APP_TIMEZONE || "Asia/Shanghai";
   const model = env.DEEPSEEK_MODEL || "deepseek-chat";
   const command = await interpretFinanceCommand(env.DEEPSEEK_API_KEY, model, timeZone, message.text);
@@ -144,8 +151,12 @@ async function handleText(env: Env, update: TelegramUpdate): Promise<void> {
   }
 
   if (command.action === "undo") {
-    const result = await undoLatestTransactionGroup(env.DB, chatId);
-    const reply = result.found ? `已撤销最近一次记账，共 ${result.count} 笔。` : "没有可撤销的记账记录。";
+    const result = await undoLatestTransactionGroup(env.DB, chatId, messageId);
+    const reply = result.duplicate
+      ? "这条撤销已经执行过，没有重复删除。"
+      : result.found
+        ? `已撤销最近一次记账，共 ${result.count} 笔。`
+        : "没有可撤销的记账记录。";
     await sendTelegram(env, chatId, reply, messageId);
     return;
   }

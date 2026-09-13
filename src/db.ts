@@ -59,6 +59,22 @@ function buildWhere(range: DateRange, filter: ReportFilter): WhereClause {
   return { sql: conditions.join(" AND "), bindings };
 }
 
+function isUniqueViolation(error: unknown): boolean {
+  return error instanceof Error && error.message.includes("UNIQUE constraint failed");
+}
+
+export async function isUpdateProcessed(
+  db: D1Database,
+  chatId: string,
+  messageId: string,
+): Promise<boolean> {
+  const row = await db
+    .prepare("SELECT 1 AS seen FROM processed_updates WHERE telegram_chat_id = ? AND telegram_message_id = ?")
+    .bind(chatId, messageId)
+    .first<{ seen: number }>();
+  return row != null;
+}
+
 export async function createTransactions(
   db: D1Database,
   transactions: CreateTransactionInput[],
@@ -68,45 +84,54 @@ export async function createTransactions(
     rawText: string;
   },
 ): Promise<{ duplicate: boolean; count: number; total_fen: number }> {
-  const existing = await db
-    .prepare("SELECT COUNT(*) AS count, COALESCE(SUM(amount_fen), 0) AS total_fen FROM transactions WHERE telegram_chat_id = ? AND telegram_message_id = ?")
-    .bind(meta.chatId, meta.messageId)
-    .first<{ count: number; total_fen: number }>();
-
-  if ((existing?.count ?? 0) > 0) {
-    return {
-      duplicate: true,
-      count: Number(existing?.count ?? 0),
-      total_fen: Number(existing?.total_fen ?? 0),
-    };
-  }
-
   const sourceGroup = `${meta.chatId}:${meta.messageId}`;
-  const statements = transactions.map((item, index) =>
+  const statements = [
+    // The claim and the inserts share one D1 batch: a replayed update fails the
+    // claim's primary key, which rolls back the whole batch atomically.
     db
-      .prepare(
-        `INSERT INTO transactions (
-          id, type, amount_fen, category, description, account, occurred_at,
-          source_group, source_item_index, telegram_chat_id, telegram_message_id, raw_text
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .bind(
-        crypto.randomUUID(),
-        item.type,
-        item.amount_fen,
-        item.category,
-        item.description,
-        item.account,
-        item.occurred_at,
-        sourceGroup,
-        index,
-        meta.chatId,
-        meta.messageId,
-        meta.rawText,
-      ),
-  );
+      .prepare("INSERT INTO processed_updates (telegram_chat_id, telegram_message_id, action) VALUES (?, ?, 'create')")
+      .bind(meta.chatId, meta.messageId),
+    ...transactions.map((item, index) =>
+      db
+        .prepare(
+          `INSERT INTO transactions (
+            id, type, amount_fen, category, description, account, occurred_at,
+            source_group, source_item_index, telegram_chat_id, telegram_message_id, raw_text
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .bind(
+          crypto.randomUUID(),
+          item.type,
+          item.amount_fen,
+          item.category,
+          item.description,
+          item.account,
+          item.occurred_at,
+          sourceGroup,
+          index,
+          meta.chatId,
+          meta.messageId,
+          meta.rawText,
+        ),
+    ),
+  ];
 
-  await db.batch(statements);
+  try {
+    await db.batch(statements);
+  } catch (error) {
+    if (isUniqueViolation(error)) {
+      const existing = await db
+        .prepare("SELECT COUNT(*) AS count, COALESCE(SUM(amount_fen), 0) AS total_fen FROM transactions WHERE telegram_chat_id = ? AND telegram_message_id = ?")
+        .bind(meta.chatId, meta.messageId)
+        .first<{ count: number; total_fen: number }>();
+      return {
+        duplicate: true,
+        count: Number(existing?.count ?? 0),
+        total_fen: Number(existing?.total_fen ?? 0),
+      };
+    }
+    throw error;
+  }
 
   return {
     duplicate: false,
@@ -224,7 +249,8 @@ export async function runReport(db: D1Database, command: ReportCommand): Promise
 export async function undoLatestTransactionGroup(
   db: D1Database,
   chatId: string,
-): Promise<{ found: boolean; count: number; total_fen: number }> {
+  messageId: string,
+): Promise<{ found: boolean; duplicate: boolean; count: number; total_fen: number }> {
   const latest = await db
     .prepare(
       `SELECT source_group
@@ -236,17 +262,37 @@ export async function undoLatestTransactionGroup(
     .bind(chatId)
     .first<{ source_group: string }>();
 
-  if (!latest?.source_group) return { found: false, count: 0, total_fen: 0 };
+  if (!latest?.source_group) return { found: false, duplicate: false, count: 0, total_fen: 0 };
 
   const summary = await db
     .prepare("SELECT COUNT(*) AS count, COALESCE(SUM(amount_fen), 0) AS total_fen FROM transactions WHERE source_group = ?")
     .bind(latest.source_group)
     .first<{ count: number; total_fen: number }>();
 
-  await db.prepare("DELETE FROM transactions WHERE source_group = ?").bind(latest.source_group).run();
+  try {
+    // The claim and the delete share one D1 batch: on a replayed update the
+    // claim's primary key fails, rolling back the delete atomically, so a
+    // duplicated undo can never remove a second transaction group.
+    await db.batch([
+      db
+        .prepare("INSERT INTO processed_updates (telegram_chat_id, telegram_message_id, action) VALUES (?, ?, 'undo')")
+        .bind(chatId, messageId),
+      db
+        .prepare(
+          "DELETE FROM transactions WHERE source_group = (SELECT source_group FROM transactions WHERE telegram_chat_id = ? ORDER BY rowid DESC LIMIT 1)",
+        )
+        .bind(chatId),
+    ]);
+  } catch (error) {
+    if (isUniqueViolation(error)) {
+      return { found: true, duplicate: true, count: 0, total_fen: 0 };
+    }
+    throw error;
+  }
 
   return {
     found: true,
+    duplicate: false,
     count: Number(summary?.count ?? 0),
     total_fen: Number(summary?.total_fen ?? 0),
   };
