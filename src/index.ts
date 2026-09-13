@@ -222,7 +222,12 @@ async function handleUpdate(env: Env, update: TelegramUpdate): Promise<void> {
     throw error;
   }
 
-  console.log(`yunshu command chat=${chatId} msg=${messageId} text=${JSON.stringify(rawText.slice(0, 200))} command=${JSON.stringify(command)}`);
+  const mediaId = Array.isArray(message.photo) && message.photo.length > 0
+    ? `photo=${pickLargestPhoto(message.photo).file_id}`
+    : (message.document && SUPPORTED_IMAGE_MIME.has(message.document.mime_type ?? "")
+      ? `doc=${message.document.file_id}`
+      : (message.voice ? `voice=${message.voice.file_id}` : ""));
+  console.log(`yunshu command chat=${chatId} msg=${messageId} ${mediaId ? `${mediaId} ` : ""}text=${JSON.stringify(rawText.slice(0, 200))} command=${JSON.stringify(command)}`);
 
   if (command.action === "create") {
     const result = await createTransactions(env.DB, command.transactions, {
