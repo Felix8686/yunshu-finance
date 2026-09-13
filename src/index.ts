@@ -1,14 +1,46 @@
 import { createTransactions, isUpdateProcessed, runReport, undoLatestTransactionGroup, type ReportResult, type SummaryResult } from "./db";
-import { interpretFinanceCommand } from "./deepseek";
+import { interpretFinanceCommand, interpretFinanceCommandFromImage } from "./deepseek";
+import { MediaDownloadError, MediaTooLargeError, arrayBufferToBase64, fetchTelegramMedia, transcribeVoice } from "./media";
 import type { Env, FinanceCommand } from "./types";
+
+interface TelegramPhotoSize {
+  file_id: string;
+  file_size?: number;
+  width: number;
+  height: number;
+}
+
+interface TelegramDocument {
+  file_id: string;
+  mime_type?: string;
+  file_size?: number;
+}
+
+interface TelegramVoice {
+  file_id: string;
+  mime_type?: string;
+  file_size?: number;
+  duration?: number;
+}
 
 interface TelegramUpdate {
   message?: {
     message_id: number;
     text?: string;
+    caption?: string;
+    photo?: TelegramPhotoSize[];
+    document?: TelegramDocument;
+    voice?: TelegramVoice;
     chat: { id: number };
     from?: { id: number };
   };
+}
+
+const SUPPORTED_IMAGE_MIME = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
+const VISION_FALLBACK_MODEL = "deepseek-v4-flash-vision-exp";
+
+function pickLargestPhoto(photo: TelegramPhotoSize[]): TelegramPhotoSize {
+  return photo.reduce((largest, item) => ((item.file_size ?? 0) > (largest.file_size ?? 0) ? item : largest));
 }
 
 function yuan(fen: number): string {
@@ -107,9 +139,22 @@ function renderCreate(command: Extract<FinanceCommand, { action: "create" }>): s
   return lines.join("\n");
 }
 
-async function handleText(env: Env, update: TelegramUpdate): Promise<void> {
+async function interpretPhoto(
+  env: Env,
+  timeZone: string,
+  fileId: string,
+  mimeType: string,
+  caption: string,
+): Promise<FinanceCommand> {
+  const media = await fetchTelegramMedia(env, fileId);
+  const imageBase64 = arrayBufferToBase64(media);
+  const visionModel = env.DEEPSEEK_VISION_MODEL || VISION_FALLBACK_MODEL;
+  return interpretFinanceCommandFromImage(env.DEEPSEEK_API_KEY, visionModel, timeZone, imageBase64, mimeType, caption);
+}
+
+async function handleUpdate(env: Env, update: TelegramUpdate): Promise<void> {
   const message = update.message;
-  if (!message?.text || !message.from) return;
+  if (!message?.from) return;
 
   const chatId = String(message.chat.id);
   const messageId = String(message.message_id);
@@ -128,14 +173,62 @@ async function handleText(env: Env, update: TelegramUpdate): Promise<void> {
 
   const timeZone = env.APP_TIMEZONE || "Asia/Shanghai";
   const model = env.DEEPSEEK_MODEL || "deepseek-chat";
-  const command = await interpretFinanceCommand(env.DEEPSEEK_API_KEY, model, timeZone, message.text);
-  console.log(`yunshu command chat=${chatId} msg=${messageId} text=${JSON.stringify(message.text)} command=${JSON.stringify(command)}`);
+
+  let command: FinanceCommand;
+  let rawText: string;
+  try {
+    if (message.text) {
+      command = await interpretFinanceCommand(env.DEEPSEEK_API_KEY, model, timeZone, message.text);
+      rawText = message.text;
+    } else if (Array.isArray(message.photo) && message.photo.length > 0) {
+      const photo = pickLargestPhoto(message.photo);
+      command = await interpretPhoto(env, timeZone, photo.file_id, "image/jpeg", message.caption ?? "");
+      rawText = `[image] ${message.caption ?? ""}`.trim();
+    } else if (message.document && SUPPORTED_IMAGE_MIME.has(message.document.mime_type ?? "")) {
+      command = await interpretPhoto(env, timeZone, message.document.file_id, message.document.mime_type as string, message.caption ?? "");
+      rawText = `[image] ${message.caption ?? ""}`.trim();
+    } else if (message.voice) {
+      const transcript = await transcribeVoice(env, message.voice.file_id);
+      if (!transcript) {
+        await sendTelegram(env, chatId, "语音识别失败，请重新发送。", messageId);
+        return;
+      }
+      command = await interpretFinanceCommand(env.DEEPSEEK_API_KEY, model, timeZone, transcript);
+      rawText = `[voice] ${transcript}`;
+    } else if (message.document) {
+      await sendTelegram(env, chatId, "目前只支持图片和语音消息。", messageId);
+      return;
+    } else {
+      return;
+    }
+  } catch (error) {
+    if (error instanceof MediaTooLargeError) {
+      await sendTelegram(env, chatId, "文件过大，目前无法处理。", messageId);
+      return;
+    }
+    if (error instanceof MediaDownloadError) {
+      await sendTelegram(env, chatId, "文件下载失败，请重新发送。", messageId);
+      return;
+    }
+    const isImage = Array.isArray(message.photo) || (!!message.document && SUPPORTED_IMAGE_MIME.has(message.document.mime_type ?? ""));
+    if (!message.text && isImage) {
+      await sendTelegram(env, chatId, "图片无法读取，请重新发送。", messageId);
+      return;
+    }
+    if (!message.text && message.voice) {
+      await sendTelegram(env, chatId, "语音识别失败，请重新发送。", messageId);
+      return;
+    }
+    throw error;
+  }
+
+  console.log(`yunshu command chat=${chatId} msg=${messageId} text=${JSON.stringify(rawText.slice(0, 200))} command=${JSON.stringify(command)}`);
 
   if (command.action === "create") {
     const result = await createTransactions(env.DB, command.transactions, {
       chatId,
       messageId,
-      rawText: message.text,
+      rawText,
     });
     const reply = result.duplicate
       ? "这条消息已经处理过，没有重复入账。"
@@ -199,7 +292,7 @@ export default {
     }
 
     try {
-      await handleText(env, update);
+      await handleUpdate(env, update);
     } catch (error) {
       console.error("yunshu request failed", error);
       const message = update.message;
