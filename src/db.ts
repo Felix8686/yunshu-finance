@@ -272,16 +272,14 @@ export async function undoLatestTransactionGroup(
   try {
     // The claim and the delete share one D1 batch: on a replayed update the
     // claim's primary key fails, rolling back the delete atomically, so a
-    // duplicated undo can never remove a second transaction group.
+    // duplicated undo can never remove a second transaction group. The delete
+    // targets the source_group locked above, never "whatever is latest now",
+    // so a create landing in between is not a deletion target.
     await db.batch([
       db
         .prepare("INSERT INTO processed_updates (telegram_chat_id, telegram_message_id, action) VALUES (?, ?, 'undo')")
         .bind(chatId, messageId),
-      db
-        .prepare(
-          "DELETE FROM transactions WHERE source_group = (SELECT source_group FROM transactions WHERE telegram_chat_id = ? ORDER BY rowid DESC LIMIT 1)",
-        )
-        .bind(chatId),
+      db.prepare("DELETE FROM transactions WHERE source_group = ?").bind(latest.source_group),
     ]);
   } catch (error) {
     if (isUniqueViolation(error)) {
