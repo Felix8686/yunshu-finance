@@ -1,5 +1,6 @@
 import type { Env } from "./types";
 
+const TELEGRAM_BOT_API = "https://api.telegram.org/bot";
 const TELEGRAM_FILE_API = "https://api.telegram.org/file/bot";
 
 export const MAX_MEDIA_BYTES = 20 * 1024 * 1024;
@@ -32,7 +33,7 @@ export async function fetchTelegramMedia(
 ): Promise<ArrayBuffer> {
   let info: TelegramRemoteFile;
   try {
-    const infoResponse = await fetch(`${TELEGRAM_FILE_API}${env.TELEGRAM_BOT_TOKEN}/getFile`, {
+    const infoResponse = await fetch(`${TELEGRAM_BOT_API}${env.TELEGRAM_BOT_TOKEN}/getFile`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ file_id: fileId }),
