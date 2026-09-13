@@ -9,4 +9,4 @@ DEEPSEEK_MODEL = "deepseek-chat"
 [[d1_databases]]
 binding = "DB"
 database_name = "yunshu-finance"
-database_id = "TO_BE_SET"
+database_id = "a5cec163-b1fe-474e-8c69-96b9aa5d933c"
