@@ -47,8 +47,10 @@ export type FinanceCommand =
 
 export interface Env {
   DB: D1Database;
+  AI: Ai;
   DEEPSEEK_API_KEY: string;
   DEEPSEEK_MODEL?: string;
+  DEEPSEEK_VISION_MODEL?: string;
   TELEGRAM_BOT_TOKEN: string;
   TELEGRAM_SECRET_TOKEN: string;
   OWNER_TELEGRAM_ID: string;

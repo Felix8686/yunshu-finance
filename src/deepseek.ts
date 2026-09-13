@@ -40,7 +40,9 @@ function localNow(timeZone: string): string {
   return `${map.year}-${map.month}-${map.day}T${map.hour}:${map.minute}:${map.second}`;
 }
 
-function systemPrompt(timeZone: string): string {
+// Single canonical FinanceCommand protocol prompt shared by the text
+// interpreter and the vision interpreter. Never fork this into a second copy.
+function financeSystemPrompt(timeZone: string): string {
   const now = localNow(timeZone);
   return `你是“云枢”的唯一自然语言理解层。你的职责只有一个：把用户的中文财务请求转换成严格 JSON 指令。你不能直接回答财务事实，也不能生成 SQL。
 
@@ -91,6 +93,16 @@ function systemPrompt(timeZone: string): string {
 - 你是唯一语义理解者；输出必须足够完整，让后端只需机械执行。`;
 }
 
+// Extension of the same protocol for image inputs only. Adds safety rules;
+// introduces no new actions and no second semantic path.
+const IMAGE_FINANCE_RULES = `图片输入附加规则：
+- 用户消息通常附带一张财务相关图片（小票、支付截图、账单截图、购物凭证、手写记账）和可选的 caption 文本。综合图片与 caption 理解意图，但输出仍只能是 create、report、undo、clarify、help。
+- 绝不能从看不清的图片猜测金额。金额、时间、账户等执行必需字段无法可靠识别时，必须输出 clarify，并说明缺少什么。
+- 普通小票或支付截图默认按“实际最终付款金额”生成一笔 transaction；禁止把商品明细和付款总额同时记账造成双重计算。只有用户在 caption 中明确要求按明细拆分，或图片明确包含多笔彼此独立的交易时，才拆成多个 transactions。
+- 图片中的金额必须换算为整数分（amount_fen）。
+- 图片与财务无关时输出 help 或 clarify，不得编造记账内容。
+- caption 或图片都无法确定账户时写“未指定”；无法确定时间时使用当前本地时间，图片中出现的交易时间可换算为绝对时间。`;
+
 interface DeepSeekResponse {
   choices?: Array<{
     message?: {
@@ -99,29 +111,7 @@ interface DeepSeekResponse {
   }>;
 }
 
-export async function interpretFinanceCommand(
-  apiKey: string,
-  model: string,
-  timeZone: string,
-  userText: string,
-): Promise<FinanceCommand> {
-  const response = await fetch(DEEPSEEK_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      temperature: 0,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: systemPrompt(timeZone) },
-        { role: "user", content: userText },
-      ],
-    }),
-  });
-
+async function commandFromResponse(response: Response): Promise<FinanceCommand> {
   if (!response.ok) {
     const detail = (await response.text()).slice(0, 500);
     throw new Error(`DeepSeek HTTP ${response.status}: ${detail}`);
@@ -139,4 +129,61 @@ export async function interpretFinanceCommand(
   }
 
   return validateFinanceCommand(parsed);
+}
+
+function chatRequest(model: string, messages: Array<Record<string, unknown>>): string {
+  return JSON.stringify({
+    model,
+    temperature: 0,
+    response_format: { type: "json_object" },
+    messages,
+  });
+}
+
+export async function interpretFinanceCommand(
+  apiKey: string,
+  model: string,
+  timeZone: string,
+  userText: string,
+): Promise<FinanceCommand> {
+  const response = await fetch(DEEPSEEK_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: chatRequest(model, [
+      { role: "system", content: financeSystemPrompt(timeZone) },
+      { role: "user", content: userText },
+    ]),
+  });
+  return commandFromResponse(response);
+}
+
+export async function interpretFinanceCommandFromImage(
+  apiKey: string,
+  visionModel: string,
+  timeZone: string,
+  imageBase64: string,
+  mimeType: string,
+  caption: string,
+): Promise<FinanceCommand> {
+  const response = await fetch(DEEPSEEK_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: chatRequest(visionModel, [
+      { role: "system", content: `${financeSystemPrompt(timeZone)}\n\n${IMAGE_FINANCE_RULES}` },
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: `data:${mimeType};base64,${imageBase64}` } },
+          { type: "text", text: caption || "请根据图片内容生成财务指令。" },
+        ],
+      },
+    ]),
+  });
+  return commandFromResponse(response);
 }
