@@ -119,6 +119,7 @@ async function handleText(env: Env, update: TelegramUpdate): Promise<void> {
   const timeZone = env.APP_TIMEZONE || "Asia/Shanghai";
   const model = env.DEEPSEEK_MODEL || "deepseek-chat";
   const command = await interpretFinanceCommand(env.DEEPSEEK_API_KEY, model, timeZone, message.text);
+  console.log(`yunshu command chat=${chatId} msg=${messageId} text=${JSON.stringify(message.text)} command=${JSON.stringify(command)}`);
 
   if (command.action === "create") {
     const result = await createTransactions(env.DB, command.transactions, {
