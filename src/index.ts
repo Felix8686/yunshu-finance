@@ -176,6 +176,7 @@ export default {
 
     const secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
     if (!env.TELEGRAM_SECRET_TOKEN || secret !== env.TELEGRAM_SECRET_TOKEN) {
+      console.log(`yunshu auth failed expected_len=${env.TELEGRAM_SECRET_TOKEN?.length ?? -1} got_len=${secret?.length ?? -1}`);
       return new Response("Unauthorized", { status: 401 });
     }
 
