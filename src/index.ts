@@ -81,7 +81,10 @@ async function sendTelegram(env: Env, chatId: string, text: string, replyToMessa
     chat_id: chatId,
     text: text.slice(0, 4000),
   };
-  if (replyToMessageId) body.reply_to_message_id = Number(replyToMessageId);
+  if (replyToMessageId) {
+    body.reply_to_message_id = Number(replyToMessageId);
+    body.allow_sending_without_reply = true;
+  }
 
   const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
