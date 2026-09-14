@@ -1,4 +1,5 @@
 import { canonicalizeJson, sha256Hex, type FinancePresentation, type FinanceResult, type RenderPayload } from './protocol';
+import { assertRenderCapacity } from './capacity';
 
 function yuan(fen: number): string {
   return `¥${(fen / 100).toFixed(2)}`;
@@ -77,5 +78,6 @@ export async function renderFinanceResult(
     });
   }
   const payload: RenderPayload = { schema_version: 2, telegram_parts: telegramParts };
+  assertRenderCapacity(payload);
   return { payload, render_hash: await sha256Hex(canonicalizeJson(payload)) };
 }

@@ -1,11 +1,12 @@
 import { resolveTelegramReferenceTime, telegramMessageDateToDate } from '../telegram-time';
 import type { TelegramUpdate } from '../types';
-import { sha256Hex, type AttachmentReference, type FinanceActor, type FinanceChannel, type FinanceTurn } from './protocol';
+import { canonicalizeJson, sha256Hex, type AttachmentReference, type FinanceActor, type FinanceChannel, type FinanceTurn } from './protocol';
 
 export interface ApiTurnInput {
   requestId: string;
   text?: string | null;
   structuredPayload?: unknown;
+  structuredPatch?: unknown;
   subjectId?: 'api:owner';
   baseSessionVersion?: number | null;
   sessionKey: string;
@@ -112,18 +113,26 @@ export async function buildTelegramFinanceTurn(
 
 export async function buildApiFinanceTurn(input: ApiTurnInput): Promise<FinanceTurn> {
   const receivedTime = input.receivedTime || new Date().toISOString();
-  return buildTurn({
+  const turn = await buildTurn({
     channel: input.structuredPayload === undefined ? 'api' : 'api',
     channelEventId: `api_${input.requestId}`,
     idempotencyKey: input.requestId,
     sessionKey: input.sessionKey,
-    ordering: { kind: 'api', base_session_version: input.baseSessionVersion || 0, request_id: input.requestId },
+    ordering: { kind: 'api', base_session_version: input.baseSessionVersion ?? 0, request_id: input.requestId },
     eventTime: input.eventTime || receivedTime,
     receivedTime,
     text: input.text ?? (input.structuredPayload === undefined ? null : JSON.stringify(input.structuredPayload)),
     attachments: [],
     baseSessionVersion: input.baseSessionVersion ?? null
   });
+  turn.payload_hash = await sha256Hex(canonicalizeJson({
+    session_key: input.sessionKey,
+    text: input.text ?? null,
+    plan: input.structuredPayload ?? null,
+    plan_patch: input.structuredPatch ?? null,
+    base_session_version: input.baseSessionVersion ?? null
+  }));
+  return turn;
 }
 
 export async function buildReceiptFinanceTurn(input: ReceiptTurnInput): Promise<FinanceTurn> {

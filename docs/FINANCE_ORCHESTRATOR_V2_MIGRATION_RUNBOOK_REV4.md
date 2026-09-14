@@ -1,6 +1,6 @@
 # Finance Orchestrator V2 — Revision 4 Migration / Cutover / Rollback Runbook
 
-Status: architecture-only normative runbook. The SQL below defines the intended 0008/0009 migration family but is not yet authorized for production execution.
+Status: normative migration/cutover runbook. The SQL below defines the 0008/0009 migration family; 0008/0009 have now been applied to the authorized remote main D1, while the cutover gates below remain mandatory and `primary_v2` is not implied.
 
 Production baseline at architecture freeze: `main` = `b707ddb8a5c627ceb0677c1677e9c4b59005fe19`.
 
@@ -552,6 +552,8 @@ Before returning from `primary_v1` to V2:
 
 The implementation must provide read-only operational queries/scripts for at least:
 
+The D1 portion is collected by the checked-in read-only query set at `scripts/finance-v2-observation.sql`; Queue backlog/retry/dead-letter and Workers Paid evidence remain provider-side checklist items.
+
 ```text
 runtime control row + config epoch
 Cloudflare account plan evidence = Workers Paid
@@ -566,6 +568,21 @@ compatibility_interrupted session count
 ```
 
 Exact commands depend on final Wrangler/Queue identifiers, but they must be written into the production rollout checklist before remote execution.
+
+### 12.1 2026-09-08 remote evidence
+
+- Main D1 readback shows 0001-0009 present and no pending migration; the pre-migration backup remains outside this repository and is not reproduced here.
+- The dedicated shadow D1 has the `finance_shadow_comparisons` table and index, with zero rows before real Telegram traffic. Its `d1_migrations` table is empty because the shadow SQL was applied directly; do not treat that as a Wrangler migration-history proof.
+- The deployed Worker exposes D1/R2/Queue/Veryfi health successfully. The real queue is `wanxiang-receipt-dev`, with one producer and one consumer for `wanxiang-cloud-dev`.
+- The shadow-stage runtime readback was epoch 2: `shadow_v2 / interpretation_only`, receipt `v1`, outbox `paused`. This was a routing fact, not proof of V2 semantic or delivery success.
+- After the passing shadow sample, the controlled CAS transition returned HTTP 200 and current runtime is epoch 3: `canary_v2 / shadow_mode=off`, receipt `v1`, outbox `enabled`. Queue pump retry/no-duplicate, mutation canary, receipt V2 provider E2E, rollback/re-enable, and Paid capacity acceptance remain open gates.
+
+### 12.2 2026-09-08 shadow sample and remediation
+
+- The first owner read-only query produced a real redacted comparison at `2026-09-08T11:21:11.199Z`: V1 was `command/query`; V2 was `error`, `schema_valid=0`, with `operation_class_mismatch` and `v2_schema_invalid`. It did not create a V2 turn, operation, outbox row, receipt job, provider attempt, or transaction.
+- The root cause was a loose model response contract: the model returned a non-canonical relative-time structure instead of the typed end-exclusive Asia/Shanghai range. The Worker now uses a plan-only response schema for generation, strict nested response fields, and the Telegram event date in the prompt. A real Workers AI probe returned a canonical read-only query plan without writing D1.
+- Code deployment `b8854a3e-d2a4-4c93-815b-41902fa23696` is live. A second owner query at `2026-09-08T11:45:03.490Z` produced V1=`command/query`, V2=`query`, `schema_valid=1`, temporal scope present, presentation=`details`, reference absent, divergence `[]`, one model call and 22.241 seconds latency. The first failed sample remains as a diagnostic record and is not counted as acceptance.
+- Canary entry is now recorded at epoch 3 with outbox enabled. The pre-canary main-D1 baseline is operation rows=0, outbox rows=0, and total transaction rows=4497; no canary mutation has been submitted yet.
 
 ## 13. Migration/rollback acceptance gate
 

@@ -605,7 +605,21 @@ export default {
         });
 
         const intakeRes = await this.fetch(intakeReq, env);
-        const intakeJson = (await intakeRes.json()) as { ok: boolean; message?: string; error?: string };
+        const intakeJson = (await intakeRes.json()) as {
+          ok: boolean;
+          message?: string;
+          error?: string;
+          data?: { transaction_id?: string; transactions?: unknown[]; total?: number };
+        };
+
+        const legacyOperationClass = intakeJson.ok && (intakeJson.data?.transaction_id
+          || (Array.isArray(intakeJson.data?.transactions) && intakeJson.data.transactions.length))
+          ? 'create'
+          : intakeJson.ok && typeof intakeJson.data?.total === 'number'
+            ? 'summarize'
+            : intakeJson.ok
+              ? 'query'
+              : 'error';
 
         const replyText = intakeJson.message || intakeJson.error || '已处理请求。';
 
@@ -621,7 +635,7 @@ export default {
           });
         }
 
-        return jsonResponse({ ok: true });
+        return jsonResponse({ ok: true, legacy_operation_class: legacyOperationClass });
       } catch (err: unknown) {
         return jsonResponse({ ok: false, error: 'WEBHOOK_PROCESS_FAILED' }, 500);
       }

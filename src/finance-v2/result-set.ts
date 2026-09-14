@@ -6,9 +6,10 @@ import {
   type ResultSetItemSnapshot,
   type ResultSetSnapshot
 } from './protocol';
+import { MAX_RESULT_SET_ROWS } from './capacity';
 
 export interface ResultSetRowInput {
-  entity_type: string;
+  entity_type: ResultSetItemSnapshot['entity_type'];
   entity_id: string;
   entity_fingerprint?: string;
   snapshot: unknown;
@@ -110,7 +111,7 @@ export async function buildResultSetSnapshot(input: {
   createdAt?: string;
   expiresAt: string;
 }): Promise<ResultSetSnapshot> {
-  if (input.rows.length > 200) throw new Error('RESULT_SET_TOO_LARGE');
+  if (input.rows.length > MAX_RESULT_SET_ROWS) throw new Error('RESULT_SET_TOO_LARGE');
   const items: ResultSetItemSnapshot[] = [];
   for (let index = 0; index < input.rows.length; index += 1) {
     const row = input.rows[index];

@@ -1,6 +1,7 @@
 import type { Env } from '../types';
 import { readRuntimeControl } from './persistence';
 import { sha256Hex, type RenderPayload } from './protocol';
+import { assertRenderCapacity, MAX_OUTBOX_ATTEMPTS } from './capacity';
 
 interface OutboxRow {
   outbox_id: string;
@@ -25,6 +26,22 @@ interface TelegramSendResponse {
   result?: { message_id?: number };
 }
 
+export interface FinanceOutboxDispatchJob {
+  kind: 'finance_outbox_dispatch';
+}
+
+export function isFinanceOutboxDispatchJob(value: unknown): value is FinanceOutboxDispatchJob {
+  return !!value && typeof value === 'object' && (value as { kind?: unknown }).kind === 'finance_outbox_dispatch';
+}
+
+export async function enqueueFinanceOutboxDispatch(env: Env, delaySeconds = 0): Promise<void> {
+  if (!env.RECEIPT_QUEUE) throw new Error('FINANCE_OUTBOX_QUEUE_NOT_CONFIGURED');
+  await env.RECEIPT_QUEUE.send(
+    { kind: 'finance_outbox_dispatch' } satisfies FinanceOutboxDispatchJob,
+    delaySeconds > 0 ? { delaySeconds } : undefined
+  );
+}
+
 function changes(result: unknown): number {
   return Number((result as { meta?: { changes?: number } } | undefined)?.meta?.changes || 0);
 }
@@ -37,11 +54,11 @@ async function claimNextOutbox(env: Env, owner: string): Promise<OutboxRow | nul
        FROM finance_outbox o
        JOIN finance_results r ON r.result_id = o.result_id
       WHERE o.status IN ('pending', 'failed_retryable')
-        AND o.attempt_count < 5
+        AND o.attempt_count < ?
         AND (o.next_attempt_at IS NULL OR julianday(o.next_attempt_at) <= julianday('now'))
       ORDER BY o.created_at, o.outbox_id
       LIMIT 1`
-  ).first<OutboxRow>();
+  ).bind(MAX_OUTBOX_ATTEMPTS).first<OutboxRow>();
   if (!candidate) return null;
   const expiresAt = new Date(Date.now() + 120_000).toISOString();
   const claimed = await env.DB.prepare(
@@ -50,14 +67,14 @@ async function claimNextOutbox(env: Env, owner: string): Promise<OutboxRow | nul
             route_epoch = ?, lease_expires_at = ?, last_attempt_started_at = CURRENT_TIMESTAMP,
             attempt_count = attempt_count + 1, last_error_code = NULL
       WHERE outbox_id = ? AND status IN ('pending', 'failed_retryable')
-        AND attempt_count < 5
+        AND attempt_count < ?
         AND EXISTS (
           SELECT 1 FROM finance_runtime_control c
            WHERE c.control_id = 'primary'
              AND c.config_epoch = ?
              AND c.outbox_mode IN ('enabled', 'draining')
         )`
-  ).bind(owner, control.config_epoch, expiresAt, candidate.outbox_id, control.config_epoch).run();
+  ).bind(owner, control.config_epoch, expiresAt, candidate.outbox_id, MAX_OUTBOX_ATTEMPTS, control.config_epoch).run();
   if (changes(claimed) !== 1) return null;
   return env.DB.prepare(
     `SELECT o.*, r.render_payload_json, r.render_hash AS stored_render_hash
@@ -106,6 +123,7 @@ async function finishOutbox(
 async function parseRenderPart(row: OutboxRow): Promise<{ text: string; partHash: string }> {
   if (row.render_hash !== row.stored_render_hash) throw new Error('RENDER_HASH_MISMATCH');
   const payload = JSON.parse(row.render_payload_json) as RenderPayload;
+  assertRenderCapacity(payload);
   const part = payload.telegram_parts.find((item) => item.part_index === row.part_index);
   if (!part || !part.part_hash || !part.text) throw new Error('RENDER_PART_NOT_FOUND');
   if (await sha256Hex(part.text) !== part.part_hash) throw new Error('RENDER_PART_HASH_MISMATCH');
@@ -157,7 +175,7 @@ export async function dispatchFinanceOutbox(env: Env, maxRows = 10): Promise<{ c
       if (sent.ok) {
         if (await finishOutbox(env, row, 'accepted', null, sent.messageId)) counts.accepted += 1;
       } else if (sent.retryable) {
-        if (row.attempt_count >= 5) {
+        if (row.attempt_count >= MAX_OUTBOX_ATTEMPTS) {
           if (await finishOutbox(env, row, 'failed_terminal', 'RETRY_LIMIT_EXCEEDED', null)) counts.terminal += 1;
         } else if (await finishOutbox(env, row, 'failed_retryable', sent.code, null)) counts.retryable += 1;
       } else if (sent.code === 'TELEGRAM_AMBIGUOUS_TRANSPORT') {

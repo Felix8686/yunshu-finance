@@ -258,6 +258,122 @@ export type FinancePlan =
   | DeletePlan
   | RestorePlan;
 
+export const MAX_RECENT_TURN_SUMMARIES = 12 as const;
+
+export interface ResultWindow {
+  result_set_id: string;
+  result_set_version: number;
+  start_ordinal: number;
+  end_ordinal: number;
+  page_size: number;
+}
+
+export interface TurnContextSnapshot {
+  schema_version: typeof FINANCE_SCHEMA_VERSION;
+  snapshot_id: string;
+  turn_id: string;
+  ledger_scope_id: typeof LEDGER_SCOPE_ID;
+  session_key: string;
+  base_session_version: number;
+  active_plan: FinancePlan | null;
+  active_result_set_id: string | null;
+  active_window: ResultWindow | null;
+  previous_window: ResultWindow | null;
+  recent_turn_summaries: string[];
+  catalog_hash: string;
+  snapshot_hash: string;
+  captured_at: string;
+}
+
+export type ReceiptJobStatus = 'queued' | 'processing' | 'artifact_ready' | 'committed' | 'rejected' | 'failed_terminal';
+
+export interface ReceiptJob {
+  schema_version: typeof FINANCE_SCHEMA_VERSION;
+  job_id: string;
+  ledger_scope_id: typeof LEDGER_SCOPE_ID;
+  turn_id: string;
+  source_event_id: string;
+  attachment_ref: string;
+  caption?: string | null;
+  status: ReceiptJobStatus;
+  lease_owner?: string | null;
+  lease_epoch: number;
+  lease_expires_at?: string | null;
+  attempt_count: number;
+  route_epoch: number;
+  receipt_artifact_id?: string | null;
+}
+
+export type ReceiptProvider = 'veryfi' | 'workers_ai_classifier';
+export type ReceiptProviderAttemptStatus = 'started' | 'succeeded' | 'failed' | 'unknown';
+
+export interface ReceiptProviderAttempt {
+  schema_version: typeof FINANCE_SCHEMA_VERSION;
+  provider_attempt_id: string;
+  job_id: string;
+  provider: ReceiptProvider;
+  job_lease_epoch: number;
+  status: ReceiptProviderAttemptStatus;
+  attempt_number: number;
+  started_at: string;
+  finished_at?: string | null;
+  error_code?: string | null;
+}
+
+export type ReceiptReconciliationStatus = 'matched' | 'within_rounding_tolerance' | 'mismatch' | 'incomplete';
+
+export interface ReceiptReconciliationEnvelope {
+  status: ReceiptReconciliationStatus;
+  items_total_fen: number;
+  receipt_total_fen: number;
+  delta_fen: number;
+  tolerance_fen: number;
+}
+
+export type ReceiptItemCategory =
+  | '食品' | '饮料' | '生鲜' | '零食' | '日用品' | '清洁用品' | '个护'
+  | '医药健康' | '母婴' | '宠物' | '家居' | '数码配件' | '服饰' | '其他';
+
+export interface ReceiptResolvedItem {
+  item_key: string;
+  name: string;
+  quantity: number;
+  unit_price_fen?: number | null;
+  line_total_fen: number;
+  raw_category_label?: string | null;
+  mapped_category: ReceiptItemCategory;
+  category_mapping_version: 'receipt-item-v1';
+  confidence: number;
+}
+
+export interface ReceiptArtifact {
+  schema_version: typeof FINANCE_SCHEMA_VERSION;
+  receipt_artifact_id: string;
+  job_id: string;
+  turn_id: string;
+  source_event_id: string;
+  attachment_ref: string;
+  provider_attempt_id: string;
+  job_lease_epoch: number;
+  merchant: string | null;
+  total_fen: number;
+  currency: 'CNY';
+  occurred_at?: string | null;
+  payment_hint?: string | null;
+  items: ReceiptResolvedItem[];
+  reconciliation: ReceiptReconciliationEnvelope;
+  validated_at: string;
+  artifact_hash: string;
+}
+
+export interface ReceiptEnvelope {
+  schema_version: typeof FINANCE_SCHEMA_VERSION;
+  job: ReceiptJob;
+  artifact: ReceiptArtifact;
+  source_turn: FinanceTurn;
+  context_snapshot: TurnContextSnapshot;
+}
+
 export type PlanPatchComponent<T> =
   | { op: 'replace'; value: T }
   | { op: 'clear' };
@@ -304,7 +420,7 @@ export interface TransactionSnapshot {
 }
 
 export interface FinanceResultRow {
-  entity_type: 'transaction' | 'transaction_item' | 'receipt';
+  entity_type: 'transaction' | 'transaction_item' | 'receipt_parent' | 'operation';
   entity_id: string;
   entity_fingerprint: string;
   snapshot: TransactionSnapshot | TransactionItemSnapshot | Record<string, unknown>;
@@ -410,6 +526,12 @@ export type FinanceResult =
   | FinanceRejectedResult
   | FinanceErrorResult;
 
+export type OrchestratorOutput =
+  | { kind: 'new_plan'; schema_version: typeof FINANCE_SCHEMA_VERSION; plan: FinancePlan; field_confidence: Record<string, number> }
+  | { kind: 'patch_plan'; schema_version: typeof FINANCE_SCHEMA_VERSION; patch: PlanPatch; field_confidence: Record<string, number> }
+  | { kind: 'clarification'; schema_version: typeof FINANCE_SCHEMA_VERSION; clarification: { reason: string; message: string } }
+  | { kind: 'non_finance'; schema_version: typeof FINANCE_SCHEMA_VERSION };
+
 export interface TelegramRenderPart {
   part_index: number;
   text: string;
@@ -423,7 +545,7 @@ export interface RenderPayload {
 
 export interface ResultSetItemSnapshot {
   ordinal: number;
-  entity_type: string;
+  entity_type: 'transaction' | 'transaction_item' | 'receipt_parent';
   entity_id: string;
   entity_fingerprint: string;
   row_snapshot_json: string;
@@ -661,6 +783,12 @@ export function assertRuntimeControl(control: RuntimeControl): void {
   }
   if (!['paused', 'enabled', 'draining'].includes(control.outbox_mode) || !['off', 'interpretation_only'].includes(control.shadow_mode)) {
     throw new ProtocolValidationError('invalid_runtime_control', 'invalid runtime route state');
+  }
+  if (control.finance_route_mode === 'shadow_v2' && control.shadow_mode !== 'interpretation_only') {
+    throw new ProtocolValidationError('invalid_runtime_control', 'shadow_v2 requires interpretation_only shadow mode');
+  }
+  if (control.finance_route_mode !== 'shadow_v2' && control.shadow_mode === 'interpretation_only') {
+    throw new ProtocolValidationError('invalid_runtime_control', 'interpretation_only shadow mode requires shadow_v2 route');
   }
   if (control.analysis_prose_enabled !== 0 && control.analysis_prose_enabled !== 1) {
     throw new ProtocolValidationError('invalid_runtime_control', 'analysis prose flag must be 0 or 1');

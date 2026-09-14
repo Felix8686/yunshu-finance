@@ -6,10 +6,10 @@ import type {
   ReceiptReconciliation,
   TelegramPhotoSize
 } from './types';
+import { MAX_RECEIPT_ITEMS } from './finance-v2/capacity';
 
 const DEFAULT_RECEIPT_VISION_MODEL = '@cf/google/gemma-4-26b-a4b-it';
 const MAX_RECEIPT_IMAGE_BYTES = 8 * 1024 * 1024;
-const MAX_RECEIPT_ITEMS = 200;
 const RECONCILIATION_TOLERANCE_FEN = 2;
 
 const ITEM_CATEGORIES: ReceiptItemCategory[] = [

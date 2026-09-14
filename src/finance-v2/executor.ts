@@ -21,6 +21,7 @@ import {
 } from './protocol';
 import { buildResultSetSnapshot, createPageToken, resultSetWindow, verifyPageToken } from './result-set';
 import { buildResultSetStatements, loadResultSetSnapshot } from './persistence';
+import { MAX_ANALYSIS_DIMENSIONS, MAX_D1_BATCH_STATEMENTS, MAX_MUTATION_TARGETS } from './capacity';
 
 interface TransactionRow {
   id: string;
@@ -83,6 +84,29 @@ function operationFence(operation: FinanceOperationRecord): { sql: string; param
     )`,
     params: [operation.operation_id, operation.lease_owner, operation.lease_epoch, operation.route_epoch]
   };
+}
+
+function assertUnchangedEntity(env: Env, row: TransactionRow, items: TransactionItemRow[]): D1StatementLike {
+  // Compare the exact state read during planning inside the commit batch.
+  // Session CAS alone does not protect writes from different sessions.
+  return env.DB.prepare(`UPDATE transactions SET id = id
+    WHERE id = ? AND type IS ? AND amount_fen IS ? AND currency IS ?
+      AND account_id IS ? AND category_id IS ? AND merchant IS ?
+      AND description IS ? AND occurred_at IS ?
+      AND (SELECT count(*) FROM transaction_items WHERE transaction_id = transactions.id) = ?
+      AND NOT EXISTS (
+        SELECT 1 FROM transaction_items i WHERE i.transaction_id = transactions.id
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(?) e
+          WHERE i.id IS json_extract(e.value, '$.id')
+            AND i.name IS json_extract(e.value, '$.name')
+            AND i.quantity IS json_extract(e.value, '$.quantity')
+            AND i.unit_price_fen IS json_extract(e.value, '$.unit_price_fen')
+            AND i.line_total_fen IS json_extract(e.value, '$.line_total_fen')
+            AND i.category IS json_extract(e.value, '$.category')
+        )
+      )`).bind(row.id, row.type, row.amount_fen, row.currency, row.account_id, row.category_id,
+        row.merchant, row.description, row.occurred_at, items.length, canonicalizeJson(items));
 }
 
 async function loadItems(env: Env, transactionIds: string[]): Promise<Map<string, TransactionItemRow[]>> {
@@ -306,7 +330,10 @@ function analysisDimensions(rows: TransactionRow[], metric: string, dimension: s
     current.count += 1;
     map.set(key, current);
   }
-  return [...map.entries()].sort((a, b) => b[1].value_fen - a[1].value_fen || a[0].localeCompare(b[0])).map(([key, value]) => ({ key, ...value }));
+  return [...map.entries()]
+    .sort((a, b) => b[1].value_fen - a[1].value_fen || a[0].localeCompare(b[0]))
+    .slice(0, MAX_ANALYSIS_DIMENSIONS)
+    .map(([key, value]) => ({ key, ...value }));
 }
 
 function summaryMetric(value: FinanceSummary, metric: string): number {
@@ -500,7 +527,7 @@ async function buildReadDraft(env: Env, plan: QueryPlan | Extract<FinancePlan, {
     sortFilterFingerprint: await sha256Hex(canonicalizeJson({ filters: plan.filters, temporalScope, presentation: plan.presentation })),
     pageSize: plan.presentation.page_size || 10,
     rows: rows.map((row) => ({
-      entity_type: row.entity_type,
+      entity_type: row.entity_type as 'transaction' | 'transaction_item' | 'receipt_parent',
       entity_id: row.entity_id,
       entity_fingerprint: row.entity_fingerprint,
       snapshot: row.snapshot
@@ -718,28 +745,67 @@ async function createDraft(env: Env, plan: CreatePlan | ReceiptCreatePlan, opera
 
 type MutationPlan = Extract<FinancePlan, { operation: 'update' | 'delete' }>;
 
+function hasEffectiveMutationFilter(filters: FinanceFilters): boolean {
+  return Boolean(
+    filters.types?.length
+    || filters.categories?.some((item) => item.value.trim())
+    || filters.accounts?.some((item) => item.value.trim())
+    || filters.merchant_text?.trim()
+    || filters.semantic_text?.trim()
+    || filters.amount_min_fen !== undefined && filters.amount_min_fen !== null
+    || filters.amount_max_fen !== undefined && filters.amount_max_fen !== null
+  );
+}
+
 async function selectMutationTargets(env: Env, plan: MutationPlan, sessionKey: string): Promise<{ rows: TransactionRow[]; items: Map<string, TransactionItemRow[]> }> {
   let selected: { rows: TransactionRow[]; items: Map<string, TransactionItemRow[]> };
   if (plan.selection.mode === 'reference') {
     const reference = plan.selection.reference;
     if (reference.kind === 'transaction') {
+      const trusted = await env.DB.prepare(
+        `SELECT 1 FROM finance_session_references
+          WHERE ledger_scope_id = 'personal:primary' AND session_key = ?
+            AND entity_id = ? AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+          LIMIT 1`
+      ).bind(sessionKey, reference.transaction_id).first();
+      if (!trusted) throw new Error('STALE_REFERENCE');
       selected = await loadTransactionsByIds(env, [reference.transaction_id]);
+      if (selected.rows.length !== 1) throw new Error('STALE_REFERENCE');
     } else if (reference.kind === 'transaction_item') {
       const parent = await env.DB.prepare(
         `SELECT transaction_id FROM transaction_items WHERE id = ?`
       ).bind(reference.item_id).first<{ transaction_id: string }>();
       if (!parent) throw new Error('STALE_REFERENCE');
+      const trusted = await env.DB.prepare(
+        `SELECT 1 FROM finance_result_set_items i
+           JOIN finance_result_sets s ON s.result_set_id = i.result_set_id
+          WHERE s.ledger_scope_id = 'personal:primary' AND s.session_key = ?
+            AND (s.expires_at IS NULL OR s.expires_at > CURRENT_TIMESTAMP)
+            AND i.entity_type = 'transaction_item' AND i.entity_id = ?
+          UNION ALL
+         SELECT 1 FROM finance_session_references
+          WHERE ledger_scope_id = 'personal:primary' AND session_key = ?
+            AND entity_id = ? AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+          LIMIT 1`
+      ).bind(sessionKey, reference.item_id, sessionKey, parent.transaction_id).first();
+      if (!trusted) throw new Error('STALE_REFERENCE');
       selected = await loadTransactionsByIds(env, [parent.transaction_id]);
     } else if (reference.kind === 'result_ordinal') {
-      const item = await env.DB.prepare(
-        `SELECT entity_id, entity_fingerprint FROM finance_result_set_items
-          WHERE result_set_id = ? AND ordinal = ?`
-      ).bind(reference.result_set_id, reference.ordinal).first<{ entity_id: string; entity_fingerprint: string }>();
+      let snapshot: ResultSetSnapshot | null;
+      try {
+        snapshot = await loadResultSetSnapshot(env.DB, reference.result_set_id, 'personal:primary', sessionKey);
+      } catch (error) {
+        if (error instanceof Error && error.message === 'EXPIRED_REFERENCE') throw error;
+        throw new Error('STALE_REFERENCE');
+      }
+      if (!snapshot) throw new Error('STALE_REFERENCE');
+      const item = snapshot.items.find((candidate) => candidate.ordinal === reference.ordinal);
       if (!item) throw new Error('EXPIRED_REFERENCE');
+      if (item.entity_type !== 'transaction' && item.entity_type !== 'receipt_parent') throw new Error('STALE_REFERENCE');
       selected = await loadTransactionsByIds(env, [item.entity_id]);
       if (selected.rows.length !== 1) throw new Error('STALE_REFERENCE');
-      const snapshot = transactionSnapshot(selected.rows[0], selected.items);
-      if (await sha256Hex(canonicalizeJson(snapshot)) !== item.entity_fingerprint) throw new Error('STALE_REFERENCE');
+      const liveSnapshot = transactionSnapshot(selected.rows[0], selected.items);
+      if (await sha256Hex(canonicalizeJson(liveSnapshot)) !== item.entity_fingerprint) throw new Error('STALE_REFERENCE');
     } else if (reference.kind === 'receipt') {
       const resultRow = await env.DB.prepare(
         `SELECT r.result_json
@@ -815,12 +881,13 @@ async function selectMutationTargets(env: Env, plan: MutationPlan, sessionKey: s
       throw new Error('REFERENCE_NOT_SUPPORTED');
     }
   } else {
+    if (!hasEffectiveMutationFilter(plan.filters)) throw new Error('INSUFFICIENT_SCOPE');
     selected = await queryTransactions(env, plan.filters, null);
   }
   const count = selected.rows.length;
+  if (count > MAX_MUTATION_TARGETS) throw new Error('OPERATION_TOO_LARGE');
   if (plan.selection.mode === 'exactly_one' && count !== 1) throw new Error('CARDINALITY_MISMATCH');
   if (plan.selection.mode === 'exact_count' && count !== plan.selection.count) throw new Error('CARDINALITY_MISMATCH');
-  if (plan.selection.mode === 'all_matching' && count > 50) throw new Error('CARDINALITY_MISMATCH');
   if (!count) throw new Error('NO_MATCH');
   return selected;
 }
@@ -857,6 +924,7 @@ async function updateDraft(env: Env, plan: Extract<FinancePlan, { operation: 'up
   const resultRowsList: FinanceResultRow[] = [];
   if (changes.item_patch && selected.rows.length !== 1) throw new Error('CARDINALITY_MISMATCH');
   for (const row of selected.rows) {
+    statements.push(assertUnchangedEntity(env, row, selected.items.get(row.id) || []));
     if (changes.item_patch) {
       const itemPatch = changes.item_patch as Record<string, unknown>;
       const target = itemPatch.target && typeof itemPatch.target === 'object' ? itemPatch.target as Record<string, unknown> : null;
@@ -1009,6 +1077,7 @@ async function deleteDraft(env: Env, plan: Extract<FinancePlan, { operation: 'de
   const resultRowsList: FinanceResultRow[] = [];
   for (const row of selected.rows) {
     const beforeSnapshot = transactionSnapshot(row, selected.items);
+    statements.push(assertUnchangedEntity(env, row, selected.items.get(row.id) || []));
     const auditId = id('audit');
     transactionIds.push(row.id);
     auditIds.push(auditId);
@@ -1126,6 +1195,7 @@ async function restoreDraft(env: Env, plan: Extract<FinancePlan, { operation: 'r
       ...fence.params
     ));
   }
+  if (statements.length > MAX_D1_BATCH_STATEMENTS) throw new Error('OPERATION_TOO_LARGE');
   return {
     result: {
       ...baseResult(plan, 'restore'),

@@ -15,7 +15,7 @@ export interface AiLike {
 }
 
 export interface QueueProducerLike {
-  send(message: unknown): Promise<void>;
+  send(message: unknown, options?: { delaySeconds?: number }): Promise<void>;
 }
 
 export interface R2ObjectHeaderLike {
@@ -63,6 +63,8 @@ export interface Env {
   TELEGRAM_OWNER_CHAT_ID?: string;
   TELEGRAM_OWNER_CHAT_TYPE?: string;
   FINANCE_PAGE_TOKEN_SECRET?: string;
+  FINANCE_RUNTIME_CONTROL_TOKEN?: string;
+  SHADOW_DB?: D1Like;
 }
 
 export type IntakeIntent = 'create_transaction' | 'spending_today' | 'unknown';

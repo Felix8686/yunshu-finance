@@ -4,6 +4,8 @@ import {
   assertRouteWitness,
   assertRuntimeControl,
   canonicalizeJson,
+  MAX_RECENT_TURN_SUMMARIES,
+  sha256Hex,
   validateResultSetSnapshot,
   type FinanceOperationRecord,
   type FinanceOperationStatus,
@@ -12,8 +14,13 @@ import {
   type FinancePlan,
   type ResultSetSnapshot,
   type RenderPayload,
-  type RuntimeControl
+  type RuntimeControl,
+  type ResultWindow,
+  type TurnContextSnapshot
 } from './protocol';
+import { planRuntimeControlTransition, type RuntimeControlPatch } from './runtime-control';
+import { MAX_D1_BATCH_STATEMENTS, MAX_FINANCE_RESULT_JSON_BYTES, MAX_MUTATION_TARGETS, MAX_OPERATION_ATTEMPTS, assertRenderCapacity } from './capacity';
+import { renderFinanceResult } from './renderer';
 
 interface D1RunMeta {
   changes?: number;
@@ -161,11 +168,61 @@ export async function readRuntimeControl(db: D1Like): Promise<RuntimeControl> {
   return runtimeControlFromRow(row);
 }
 
+export async function transitionRuntimeControl(
+  db: D1Like,
+  expectedConfigEpoch: number,
+  patch: RuntimeControlPatch
+): Promise<RuntimeControl> {
+  const current = await readRuntimeControl(db);
+  if (current.config_epoch !== expectedConfigEpoch) throw new Error('RUNTIME_CONTROL_EPOCH_CONFLICT');
+  const next = planRuntimeControlTransition(current, patch);
+  if (next.config_epoch === current.config_epoch) return current;
+  const result = await db.prepare(
+    `UPDATE finance_runtime_control
+        SET config_epoch = ?, finance_route_mode = ?, receipt_route_mode = ?,
+            outbox_mode = ?, shadow_mode = ?, analysis_prose_enabled = ?,
+            updated_at = ?
+      WHERE control_id = 'primary' AND config_epoch = ?`
+  ).bind(
+    next.config_epoch,
+    next.finance_route_mode,
+    next.receipt_route_mode,
+    next.outbox_mode,
+    next.shadow_mode,
+    next.analysis_prose_enabled,
+    next.updated_at,
+    expectedConfigEpoch
+  ).run();
+  if (changes(result) !== 1) throw new Error('RUNTIME_CONTROL_EPOCH_CONFLICT');
+  return readRuntimeControl(db);
+}
+
 export async function loadSession(db: D1Like, ledgerScopeId: string, sessionKey: string): Promise<FinanceSessionRow | null> {
   const row = await db.prepare(
     `SELECT * FROM finance_sessions WHERE ledger_scope_id = ? AND session_key = ?`
   ).bind(ledgerScopeId, sessionKey).first<Record<string, unknown>>();
   return row ? sessionFromRow(row) : null;
+}
+
+export async function loadResultWindow(
+  db: D1Like,
+  resultSetId: string | null,
+  startOrdinal: number | null,
+  endOrdinal: number | null
+): Promise<ResultWindow | null> {
+  if (!resultSetId || startOrdinal === null || endOrdinal === null) return null;
+  const row = await db.prepare(
+    `SELECT result_set_id, result_set_version, page_size
+       FROM finance_result_sets WHERE result_set_id = ?`
+  ).bind(resultSetId).first<{ result_set_id: string; result_set_version: number; page_size: number }>();
+  if (!row) return null;
+  return {
+    result_set_id: row.result_set_id,
+    result_set_version: Number(row.result_set_version),
+    start_ordinal: Number(startOrdinal),
+    end_ordinal: Number(endOrdinal),
+    page_size: Number(row.page_size)
+  };
 }
 
 export async function ensureSession(db: D1Like, ledgerScopeId: string, sessionKey: string): Promise<FinanceSessionRow> {
@@ -176,6 +233,14 @@ export async function ensureSession(db: D1Like, ledgerScopeId: string, sessionKe
   const session = await loadSession(db, ledgerScopeId, sessionKey);
   if (!session) throw new Error('FINANCE_SESSION_CREATE_FAILED');
   return session;
+}
+
+export async function markSessionCompatibilityInterrupted(db: D1Like, ledgerScopeId: string, sessionKey: string): Promise<void> {
+  await db.prepare(
+    `UPDATE finance_sessions
+        SET compatibility_interrupted = 1, updated_at = CURRENT_TIMESTAMP
+      WHERE ledger_scope_id = ? AND session_key = ?`
+  ).bind(ledgerScopeId, sessionKey).run();
 }
 
 export async function reserveTurn(db: D1Like, turn: FinanceTurn): Promise<ReserveTurnResult> {
@@ -316,6 +381,71 @@ export async function saveTurnInterpretation(
         SET interpretation_status = ?, interpretation_json = ?, plan_id = ?
       WHERE turn_id = ?`
   ).bind(interpretationStatus, interpretationJson, planId ?? null, turnId).run();
+}
+
+export async function loadRecentTurnSummaries(
+  db: D1Like,
+  ledgerScopeId: string,
+  sessionKey: string,
+  limit = MAX_RECENT_TURN_SUMMARIES
+): Promise<string[]> {
+  const boundedLimit = Math.max(1, Math.min(MAX_RECENT_TURN_SUMMARIES, Math.floor(limit)));
+  const rows = await db.prepare(
+    `SELECT turn_id, interpretation_json, plan_id, result_id
+       FROM finance_turns
+      WHERE ledger_scope_id = ? AND session_key = ?
+        AND interpretation_status = 'interpreted'
+      ORDER BY created_at DESC, turn_id DESC
+      LIMIT ?`
+  ).bind(ledgerScopeId, sessionKey, boundedLimit).all<Record<string, unknown>>();
+  return rows.results
+    .slice()
+    .reverse()
+    .map((row) => {
+      let plan: Record<string, unknown> | null = null;
+      if (typeof row.interpretation_json === 'string') {
+        try {
+          const parsed = JSON.parse(row.interpretation_json) as unknown;
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            const value = parsed as Record<string, unknown>;
+            plan = {
+              operation: typeof value.operation === 'string' ? value.operation : null,
+              plan_id: typeof value.plan_id === 'string' ? value.plan_id : null,
+              plan_version: Number.isInteger(value.plan_version) ? value.plan_version : null,
+              base_session_version: Number.isInteger(value.base_session_version) ? value.base_session_version : null,
+              reference: value.reference ?? null,
+              presentation: value.presentation ?? null
+            };
+          }
+        } catch {
+          plan = null;
+        }
+      }
+      return canonicalizeJson({
+        turn_id: typeof row.turn_id === 'string' ? row.turn_id : null,
+        plan_id: typeof row.plan_id === 'string' ? row.plan_id : null,
+        result_id: typeof row.result_id === 'string' ? row.result_id : null,
+        plan
+      }).slice(0, 2048);
+    });
+}
+
+export async function persistTurnContextSnapshot(db: D1Like, turnId: string, snapshot: TurnContextSnapshot): Promise<void> {
+  const json = canonicalizeJson(snapshot);
+  const hash = await sha256Hex(json);
+  const result = await db.prepare(
+    `UPDATE finance_turns
+        SET context_snapshot_json = ?, context_snapshot_hash = ?
+      WHERE turn_id = ? AND context_snapshot_json IS NULL`
+  ).bind(json, hash, turnId).run();
+  if (changes(result) === 1) return;
+  const existing = await db.prepare(
+    `SELECT context_snapshot_json, context_snapshot_hash
+       FROM finance_turns WHERE turn_id = ?`
+  ).bind(turnId).first<{ context_snapshot_json: string | null; context_snapshot_hash: string | null }>();
+  if (!existing || existing.context_snapshot_json !== json || existing.context_snapshot_hash !== hash) {
+    throw new Error('TURN_CONTEXT_SNAPSHOT_CONFLICT');
+  }
 }
 
 export async function completeTurn(
@@ -483,6 +613,7 @@ export function buildResultSetStatements(
       routeEpoch ?? null
     ));
   }
+  if (statements.length > MAX_D1_BATCH_STATEMENTS) throw new Error('OPERATION_TOO_LARGE');
   return statements;
 }
 
@@ -505,6 +636,7 @@ export async function updateSessionProjection(
   const result = await db.prepare(
     `UPDATE finance_sessions
         SET session_version = session_version + 1,
+            compatibility_interrupted = 0,
             active_plan_id = COALESCE(?, active_plan_id),
             active_plan_version = COALESCE(?, active_plan_version),
             active_result_set_id = COALESCE(?, active_result_set_id),
@@ -625,6 +757,7 @@ export async function claimOperation(
             updated_at = CURRENT_TIMESTAMP
       WHERE operation_id = ?
         AND route_epoch = ?
+        AND attempt_count < ?
         AND (status = 'reserved' OR (status = 'executing' AND lease_expires_at < ?))
         AND EXISTS (
           SELECT 1 FROM finance_runtime_control c
@@ -636,7 +769,7 @@ export async function claimOperation(
                (finance_operations.operation_type <> 'receipt_create' AND c.finance_route_mode IN ('canary_v2', 'primary_v2'))
              )
         )`
-  ).bind(leaseOwner, expiresAt, operation.operation_id, operation.route_epoch, now.toISOString()).run();
+  ).bind(leaseOwner, expiresAt, operation.operation_id, operation.route_epoch, MAX_OPERATION_ATTEMPTS, now.toISOString()).run();
   if (changes(result) !== 1) throw new Error('STALE_FENCE_OR_OPERATION_IN_PROGRESS');
   const claimed = await loadOperation(db, operation.operation_id);
   if (!claimed) throw new Error('FINANCE_OPERATION_CLAIM_FAILED');
@@ -665,12 +798,87 @@ export async function failFinanceOperation(
   return changes(result) === 1;
 }
 
+export async function settleRolloutInterruptedOperations(db: D1Like, limit = MAX_MUTATION_TARGETS): Promise<number> {
+  const control = await readRuntimeControl(db);
+  const boundedLimit = Math.max(1, Math.min(MAX_MUTATION_TARGETS, Math.floor(limit)));
+  const rows = await db.prepare(
+    `SELECT * FROM finance_operations
+       WHERE status IN ('reserved', 'executing')
+         AND route_epoch < ?
+       ORDER BY created_at ASC, operation_id ASC
+       LIMIT ?`
+  ).bind(control.config_epoch, boundedLimit).all<Record<string, unknown>>();
+  let settled = 0;
+  for (const row of rows.results) {
+    const operation = operationFromRow(row);
+    const resultId = `rollout_${operation.operation_id}`;
+    const draft: FinanceResult = {
+      schema_version: 2,
+      kind: 'error',
+      result_id: resultId,
+      turn_id: operation.turn_id,
+      operation: operation.operation_type,
+      ledger_scope_id: operation.ledger_scope_id,
+      commit_status: 'not_committed',
+      error: {
+        code: 'rollout_interrupted',
+        safe_message: '版本切换期间请求被中止，数据没有修改，请重新发送。'
+      },
+      render_hash: '0'.repeat(64)
+    };
+    const rendered = await renderFinanceResult(draft, {});
+    const result = { ...draft, render_hash: rendered.render_hash } as FinanceResult;
+    const resultJson = canonicalizeJson(result);
+    const renderJson = canonicalizeJson(rendered.payload);
+    const batchResults = await db.batch([
+      db.prepare(
+        `UPDATE finance_operations
+            SET status = 'failed_terminal', error_code = 'rollout_interrupted',
+                lease_owner = NULL, lease_expires_at = NULL, updated_at = CURRENT_TIMESTAMP
+          WHERE operation_id = ? AND route_epoch < ?
+            AND status IN ('reserved', 'executing')`
+      ).bind(operation.operation_id, control.config_epoch),
+      db.prepare(
+        `INSERT OR IGNORE INTO finance_results (
+           result_id, ledger_scope_id, turn_id, operation_id, schema_version,
+           operation_type, result_json, render_payload_json, render_hash,
+           result_set_id, result_json_bytes
+         ) VALUES (?, ?, ?, ?, 2, ?, ?, ?, ?, NULL, ?)`
+      ).bind(
+        result.result_id,
+        result.ledger_scope_id,
+        result.turn_id,
+        operation.operation_id,
+        result.operation,
+        resultJson,
+        renderJson,
+        rendered.render_hash,
+        new TextEncoder().encode(resultJson).byteLength
+      ),
+      db.prepare(
+        `UPDATE finance_operations
+            SET result_id = ?, updated_at = CURRENT_TIMESTAMP
+          WHERE operation_id = ? AND status = 'failed_terminal'
+            AND error_code = 'rollout_interrupted' AND result_id IS NULL`
+      ).bind(result.result_id, operation.operation_id),
+      db.prepare(
+        `UPDATE finance_turns
+            SET result_id = ?, completed_at = CURRENT_TIMESTAMP
+          WHERE turn_id = ? AND result_id IS NULL`
+      ).bind(result.result_id, operation.turn_id)
+    ]);
+    if (changes(batchResults[0]) === 1 && changes(batchResults[2]) === 1) settled += 1;
+  }
+  return settled;
+}
+
 export async function commitFinanceOperation(db: D1Like, input: CommitFinanceOperationInput): Promise<void> {
   if (input.result.kind === 'success') assertFinanceSuccessCommitStatus(input.result);
   const resultJson = canonicalizeJson(input.result);
   const renderJson = canonicalizeJson(input.render_payload);
+  assertRenderCapacity(input.render_payload);
   const computedResultBytes = new TextEncoder().encode(resultJson).byteLength;
-  if (computedResultBytes !== input.result_json_bytes || computedResultBytes > 131072) throw new Error('RESULT_SIZE_MISMATCH');
+  if (computedResultBytes !== input.result_json_bytes || computedResultBytes > MAX_FINANCE_RESULT_JSON_BYTES) throw new Error('RESULT_SIZE_MISMATCH');
   if (input.result.render_hash !== input.render_hash) throw new Error('RENDER_HASH_MISMATCH');
   const outboxStatements = input.outbox_rows.map((row) => db.prepare(
     `INSERT OR IGNORE INTO finance_outbox (
@@ -751,12 +959,21 @@ export async function commitFinanceOperation(db: D1Like, input: CommitFinanceOpe
     input.operation.lease_epoch,
     input.operation.route_epoch
   );
-  const batchResults = await db.batch([
+  const writes = [
     ...input.side_effect_statements,
     resultStatement,
     ...outboxStatements,
     terminalStatement
+  ];
+  // Zero-row CAS updates are not SQL errors. Assert each write inside the
+  // same transaction so a lost fence rolls back preceding ledger mutations.
+  if (writes.length * 2 > MAX_D1_BATCH_STATEMENTS) throw new Error('OPERATION_TOO_LARGE');
+  const guarded = writes.flatMap((statement) => [
+    statement,
+    db.prepare(`SELECT CASE WHEN changes() = 1 THEN 1 ELSE abs(-9223372036854775808) END AS write_assertion`)
   ]);
+  const guardedResults = await db.batch(guarded);
+  const batchResults = guardedResults.filter((_, index) => index % 2 === 0);
   const sideEffectChanges = batchResults
     .slice(0, input.side_effect_statements.length)
     .map(changes);

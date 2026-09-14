@@ -1,8 +1,10 @@
 import type { Env } from '../types';
+import { loadFinanceReferenceCatalog, type FinanceReferenceCatalog } from '../finance-reference';
 import {
   canonicalizeJson,
   deriveDeliveryRequestId,
   ProtocolValidationError,
+  sha256Hex,
   type FinanceOperationType,
   type FinancePlan,
   type FinanceResult,
@@ -15,14 +17,19 @@ import {
   failFinanceOperation,
   ensureSession,
   loadFinanceResult,
+  loadRecentTurnSummaries,
+  loadResultWindow,
   loadPlan,
   loadTurnResult,
   readRuntimeControl,
   reserveOperation,
   reserveTurn,
   saveTurnInterpretation,
+  persistTurnContextSnapshot,
   storePlan
 } from './persistence';
+import { buildTurnContextSnapshot } from './context';
+import { assertPlanCapacity } from './capacity';
 import { prepareFinanceExecution } from './executor';
 import { applyFinancePlanPatch, interpretFinanceTurn, validateFinancePlan } from './orchestrator';
 import { renderFinanceResult } from './renderer';
@@ -34,6 +41,7 @@ export interface FinanceV2ServiceOptions {
     receiptArtifact?: unknown;
     baselinePlan?: unknown;
     requiredOperation?: FinanceOperationType;
+    referenceCatalog?: FinanceReferenceCatalog;
   };
   telegramDestinationId?: string;
   telegramThreadId?: string | null;
@@ -45,6 +53,7 @@ export interface FinanceV2ServiceOptions {
 export interface FinanceV2ServiceResponse {
   result: FinanceResult;
   render_payload?: RenderPayload;
+  delivery_queued?: boolean;
   operation_id?: string;
   duplicate?: boolean;
   in_progress?: boolean;
@@ -66,11 +75,71 @@ function errorResult(turn: FinanceTurn, code: string, safeMessage: string, opera
   };
 }
 
-async function persistErrorResult(env: Env, turn: FinanceTurn, response: FinanceV2ServiceResponse): Promise<FinanceV2ServiceResponse> {
+async function renderErrorResponse(response: FinanceV2ServiceResponse): Promise<FinanceV2ServiceResponse> {
   const rendered = await renderFinanceResult(response.result, {});
-  const result = { ...response.result, render_hash: rendered.render_hash } as FinanceResult;
+  return {
+    ...response,
+    result: { ...response.result, render_hash: rendered.render_hash } as FinanceResult,
+    render_payload: rendered.payload
+  };
+}
+
+async function persistErrorResult(
+  env: Env,
+  turn: FinanceTurn,
+  response: FinanceV2ServiceResponse,
+  options: Pick<FinanceV2ServiceOptions, 'telegramDestinationId' | 'telegramThreadId'> = {}
+): Promise<FinanceV2ServiceResponse> {
+  const renderedResponse = await renderErrorResponse(response);
+  const result = renderedResponse.result;
+  const renderPayload = renderedResponse.render_payload;
+  if (!renderPayload) throw new Error('RENDER_PAYLOAD_INVALID');
   const resultJson = canonicalizeJson(result);
-  const renderJson = canonicalizeJson(rendered.payload);
+  const renderJson = canonicalizeJson(renderPayload);
+  let deliveryQueued = false;
+  if (options.telegramDestinationId) {
+    try {
+      const runtime = await readRuntimeControl(env.DB);
+      deliveryQueued = (runtime.outbox_mode === 'enabled' || runtime.outbox_mode === 'draining')
+        && (turn.channel === 'receipt'
+          ? runtime.receipt_route_mode === 'v2'
+          : ['canary_v2', 'primary_v2'].includes(runtime.finance_route_mode));
+    } catch {
+      deliveryQueued = false;
+    }
+  }
+  const deliveryRequestId = options.telegramDestinationId && deliveryQueued
+    ? await deriveDeliveryRequestId({
+        result_id: result.result_id,
+        destination_id: options.telegramDestinationId,
+        kind: 'initial',
+        initial_turn_id: turn.turn_id
+      })
+    : null;
+  const outboxStatements = deliveryRequestId && options.telegramDestinationId
+    ? renderPayload.telegram_parts.map((part) => env.DB.prepare(
+        `INSERT OR IGNORE INTO finance_outbox (
+           outbox_id, ledger_scope_id, result_id, delivery_request_id, part_index,
+           render_hash, destination_type, destination_id, thread_id, status,
+           lease_epoch, route_epoch
+         ) SELECT ?, 'personal:primary', ?, ?, ?, ?, 'telegram_owner', ?, ?, 'pending', 0, c.config_epoch
+             FROM finance_runtime_control c
+            WHERE c.control_id = 'primary'
+              AND c.outbox_mode IN ('enabled', 'draining')
+              AND ((? = 'receipt' AND c.receipt_route_mode = 'v2')
+                   OR (? <> 'receipt' AND c.finance_route_mode IN ('canary_v2', 'primary_v2')))`
+      ).bind(
+        `${deliveryRequestId}_${part.part_index}`,
+        result.result_id,
+        deliveryRequestId,
+        part.part_index,
+        result.render_hash,
+        options.telegramDestinationId,
+        options.telegramThreadId ?? null,
+        turn.channel,
+        turn.channel
+      ))
+    : [];
   await env.DB.batch([
     env.DB.prepare(
       `INSERT OR IGNORE INTO finance_results (
@@ -85,16 +154,17 @@ async function persistErrorResult(env: Env, turn: FinanceTurn, response: Finance
       result.operation,
       resultJson,
       renderJson,
-      rendered.render_hash,
+      result.render_hash,
       new TextEncoder().encode(resultJson).byteLength
     ),
+    ...outboxStatements,
     env.DB.prepare(
       `UPDATE finance_turns
           SET result_id = ?, completed_at = CURRENT_TIMESTAMP
         WHERE turn_id = ? AND result_id IS NULL`
     ).bind(result.result_id, turn.turn_id)
   ]);
-  return { ...response, result, render_payload: rendered.payload };
+  return { ...renderedResponse, delivery_queued: deliveryQueued };
 }
 
 function operationFence(operation: { operation_id: string; operation_type: string; lease_owner?: string | null; lease_epoch: number; route_epoch: number }): { sql: string; params: unknown[] } {
@@ -122,6 +192,7 @@ function sessionReferenceKind(operation: FinanceOperationType): string {
 }
 
 function classifyFailure(message: string): { code: string; safeMessage: string } {
+  if (message === 'INSUFFICIENT_SCOPE') return { code: 'ambiguous_target', safeMessage: '修改范围不够明确，请先指定具体账目或筛选条件。没有执行修改。' };
   if (message === 'STALE_REFERENCE') return { code: 'stale_reference', safeMessage: '这条引用对应的账目已经发生变化，没有继续修改。请重新查询后再操作。' };
   if (message === 'EXPIRED_REFERENCE') return { code: 'expired_reference', safeMessage: '这条引用已经过期，请重新查询后再操作。' };
   if (message === 'NO_MATCH') return { code: 'no_match', safeMessage: '没有找到符合条件的账目，没有执行修改。' };
@@ -130,6 +201,9 @@ function classifyFailure(message: string): { code: string; safeMessage: string }
   if (message === 'INVALID_CATEGORY' || message === 'CATEGORY_NOT_CONFIGURED') return { code: 'invalid_category', safeMessage: '分类无法确认，没有执行修改。' };
   if (message === 'ITEM_PATCH_NOT_IMPLEMENTED' || message === 'REFERENCE_NOT_SUPPORTED' || message === 'PAGE_TOKEN_UNSUPPORTED') return { code: 'unsupported_request', safeMessage: '这个请求形式暂时不支持，没有执行修改。' };
   if (message === 'PAGE_TOKEN_SECRET_NOT_CONFIGURED' || message === 'OUTBOX_NOT_ENABLED') return { code: 'route_not_ready', safeMessage: '当前 V2 依赖尚未配置完成，数据没有修改。' };
+  if (message === 'OPERATION_TOO_LARGE') return { code: 'operation_too_large', safeMessage: '这次请求包含的数据量过大，请拆成几次操作。' };
+  if (message === 'RESULT_TOO_LARGE' || message === 'RENDER_TOO_LARGE') return { code: 'result_too_large', safeMessage: '结果内容过大，请缩小查询范围后重试。' };
+  if (message === 'RENDER_PAYLOAD_INVALID' || message === 'RENDER_HASH_MISMATCH' || message === 'RENDER_PART_HASH_MISMATCH') return { code: 'render_integrity_failed', safeMessage: '结果校验失败，没有发送或写入，请稍后重试。' };
   if (message === 'STALE_FENCE_OR_SESSION_CAS' || message === 'SESSION_CAS_CONFLICT') return { code: 'ordering_conflict', safeMessage: '会话已经被另一条请求更新，请刷新后重试。' };
   if (message.startsWith('STALE_FENCE')) return { code: 'stale_fence', safeMessage: '这条请求已经过期，没有执行修改。' };
   return { code: message === 'V2_OPERATION_NOT_IMPLEMENTED' ? message : 'db_commit_failed', safeMessage: '本次请求没有完成写入，请稍后重试。' };
@@ -149,7 +223,7 @@ async function enqueueReplayDelivery(
   if (!stored) throw new Error('FINANCE_RESULT_NOT_FOUND');
   const payload = JSON.parse(stored.render_payload_json) as RenderPayload;
   const runtime = await readRuntimeControl(env.DB);
-  if (!['enabled', 'draining'].includes(runtime.outbox_mode)) throw new Error('OUTBOX_NOT_ENABLED');
+  if (runtime.outbox_mode !== 'enabled') throw new Error('OUTBOX_NOT_ENABLED');
   const deliveryRequestId = await deriveDeliveryRequestId({
     result_id: resultId,
     destination_id: destinationId,
@@ -162,8 +236,8 @@ async function enqueueReplayDelivery(
        render_hash, destination_type, destination_id, thread_id, status,
        lease_epoch, route_epoch
      ) SELECT ?, 'personal:primary', ?, ?, ?, ?, 'telegram_owner', ?, ?, 'pending', 0, c.config_epoch
-       FROM finance_runtime_control c
-      WHERE c.control_id = 'primary' AND c.outbox_mode IN ('enabled', 'draining')`
+        FROM finance_runtime_control c
+       WHERE c.control_id = 'primary' AND c.outbox_mode = 'enabled'`
   ).bind(
     `${deliveryRequestId}_${part.part_index}`,
     resultId,
@@ -185,7 +259,7 @@ export async function handleFinanceV2Turn(
   if (options.telegramDestinationId) {
     const configuredOwnerChatId = env.TELEGRAM_OWNER_CHAT_ID?.trim();
     if (!configuredOwnerChatId || configuredOwnerChatId !== options.telegramDestinationId) {
-      return errorResult(turn, 'unauthorized', '消息投递目标未配置或不属于当前账本。');
+      return renderErrorResponse(errorResult(turn, 'unauthorized', '消息投递目标未配置或不属于当前账本。'));
     }
   }
   let reservation: Awaited<ReturnType<typeof reserveTurn>>;
@@ -194,10 +268,10 @@ export async function handleFinanceV2Turn(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (message === 'STALE_TELEGRAM_ORDER' || message === 'TELEGRAM_ORDERING_CURSOR_NOT_FOUND') {
-      return errorResult(turn, 'ordering_conflict', '这条 Telegram 消息顺序已经过期，请重新发送最新消息。');
+      return renderErrorResponse(errorResult(turn, 'ordering_conflict', '这条 Telegram 消息顺序已经过期，请重新发送最新消息。'));
     }
-    if (message === 'IDEMPOTENCY_CONFLICT') return errorResult(turn, 'idempotency_conflict', '同一请求标识对应了不同内容，没有执行修改。');
-    return errorResult(turn, 'db_read_failed', '请求没有成功登记，请稍后重试。');
+    if (message === 'IDEMPOTENCY_CONFLICT') return renderErrorResponse(errorResult(turn, 'idempotency_conflict', '同一请求标识对应了不同内容，没有执行修改。'));
+    return renderErrorResponse(errorResult(turn, 'db_read_failed', '请求没有成功登记，请稍后重试。'));
   }
   if (!reservation.created) {
     const storedTurn = await loadTurnResult(env.DB, reservation.turn_id);
@@ -212,14 +286,45 @@ export async function handleFinanceV2Turn(
     }
     if (storedTurn?.completed_at) {
       const failed = errorResult({ ...turn, turn_id: reservation.turn_id }, 'previous_failure', '上一次处理没有完成写入，请重新发送。');
-      return { ...(await persistErrorResult(env, { ...turn, turn_id: reservation.turn_id }, failed)), duplicate: true };
+      return { ...(await persistErrorResult(env, { ...turn, turn_id: reservation.turn_id }, failed, options)), duplicate: true };
     }
-    return { ...errorResult(turn, 'in_progress', '这条请求正在处理中，请稍后重试。'), in_progress: true };
+    return { ...(await renderErrorResponse(errorResult(turn, 'in_progress', '这条请求正在处理中，请稍后重试。'))), in_progress: true };
   }
 
   const session = await ensureSession(env.DB, turn.actor.ledger_scope_id, turn.session_key);
   const baseSessionVersion = turn.base_session_version ?? session.session_version;
-  const activePlan = await loadPlan(env.DB, session.active_plan_id, session.active_plan_version);
+  const compatibilityInterrupted = session.compatibility_interrupted === 1;
+  const activePlan = compatibilityInterrupted ? null : await loadPlan(env.DB, session.active_plan_id, session.active_plan_version);
+  let recentTurnSummaries: string[];
+  let referenceCatalog: FinanceReferenceCatalog;
+  try {
+    recentTurnSummaries = compatibilityInterrupted
+      ? []
+      : await loadRecentTurnSummaries(env.DB, turn.actor.ledger_scope_id, turn.session_key);
+    referenceCatalog = await loadFinanceReferenceCatalog(env);
+    const catalogHash = await sha256Hex(canonicalizeJson(referenceCatalog));
+    const activeWindow = compatibilityInterrupted
+      ? null
+      : await loadResultWindow(env.DB, session.active_result_set_id, session.active_window_start_ordinal, session.active_window_end_ordinal);
+    const previousWindow = compatibilityInterrupted
+      ? null
+      : await loadResultWindow(env.DB, session.active_result_set_id, session.previous_window_start_ordinal, session.previous_window_end_ordinal);
+    await persistTurnContextSnapshot(env.DB, turn.turn_id, await buildTurnContextSnapshot({
+      turnId: turn.turn_id,
+      sessionKey: turn.session_key,
+      baseSessionVersion,
+      activePlan,
+      activeResultSetId: compatibilityInterrupted ? null : session.active_result_set_id,
+      activeWindow,
+      previousWindow,
+      recentTurnSummaries,
+      catalogHash
+    }));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await saveTurnInterpretation(env.DB, turn.turn_id, 'failed', JSON.stringify({ code: 'context_snapshot_failed', detail: message }));
+    return persistErrorResult(env, turn, errorResult(turn, 'context_snapshot_failed', '会话上下文暂时无法保存，没有执行修改。'), options);
+  }
   let plan: FinancePlan;
   try {
     const structuredPlan = options.structuredPlan && typeof options.structuredPlan === 'object'
@@ -238,8 +343,9 @@ export async function handleFinanceV2Turn(
       ? validateFinancePlan(structuredPlan, effectiveTurn)
       : await interpretFinanceTurn(env, effectiveTurn, {
           sessionVersion: session.session_version,
-          activePlan,
-          recentTurnSummaries: [],
+           activePlan,
+           recentTurnSummaries,
+           referenceCatalog,
           ...options.orchestratorContext
         });
   } catch (error) {
@@ -249,7 +355,16 @@ export async function handleFinanceV2Turn(
     const safeMessage = code === 'stale_turn' || code === 'ordering_conflict'
       ? '上一轮会话已经发生变化，请刷新后重试。'
       : '我没有足够把握理解这条财务请求，没有执行修改。';
-    return persistErrorResult(env, turn, errorResult(turn, code, safeMessage));
+    return persistErrorResult(env, turn, errorResult(turn, code, safeMessage), options);
+  }
+
+  try {
+    assertPlanCapacity(plan);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await saveTurnInterpretation(env.DB, turn.turn_id, 'failed', JSON.stringify({ code: message }));
+    const failure = classifyFailure(message);
+    return persistErrorResult(env, turn, errorResult(turn, failure.code, failure.safeMessage, plan.operation), options);
   }
 
   const planJson = canonicalizeJson(plan);
@@ -267,6 +382,19 @@ export async function handleFinanceV2Turn(
     operation: plan.operation
   }, planJson, planHash);
 
+  if (options.telegramDestinationId) {
+    try {
+      const runtime = await readRuntimeControl(env.DB);
+      if (runtime.outbox_mode === 'paused') {
+        await saveTurnInterpretation(env.DB, turn.turn_id, 'failed', JSON.stringify({ code: 'OUTBOX_NOT_ENABLED' }));
+        return persistErrorResult(env, turn, errorResult(turn, 'route_not_ready', '当前 V2 依赖尚未配置完成，数据没有修改。', plan.operation), options);
+      }
+    } catch {
+      await saveTurnInterpretation(env.DB, turn.turn_id, 'failed', JSON.stringify({ code: 'RUNTIME_CONTROL_NOT_FOUND' }));
+      return persistErrorResult(env, turn, errorResult(turn, 'route_not_ready', '当前 V2 运行控制暂时不可用，数据没有修改。', plan.operation), options);
+    }
+  }
+
   let reserved;
   try {
     reserved = await reserveOperation(env.DB, {
@@ -283,7 +411,7 @@ export async function handleFinanceV2Turn(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await saveTurnInterpretation(env.DB, turn.turn_id, 'failed', JSON.stringify({ code: message }));
-    return persistErrorResult(env, turn, errorResult(turn, message === 'IDEMPOTENCY_CONFLICT' ? message : 'route_not_ready', '当前 V2 路由尚未开放，数据没有修改。'));
+    return persistErrorResult(env, turn, errorResult(turn, message === 'IDEMPOTENCY_CONFLICT' ? message : 'route_not_ready', '当前 V2 路由尚未开放，数据没有修改。'), options);
   }
   if (reserved.replay) {
     if (reserved.operation.result_id) {
@@ -291,9 +419,9 @@ export async function handleFinanceV2Turn(
       if (stored) return { result: stored, duplicate: true, operation_id: reserved.operation.operation_id };
     }
     const failed = errorResult(turn, reserved.operation.error_code || 'previous_failure', '上一次处理没有完成写入，请重新发送。', reserved.operation.operation_type);
-    return { ...(await persistErrorResult(env, turn, failed)), duplicate: true, operation_id: reserved.operation.operation_id };
+    return { ...(await persistErrorResult(env, turn, failed, options)), duplicate: true, operation_id: reserved.operation.operation_id };
   }
-  if (reserved.in_progress) return { ...errorResult(turn, 'in_progress', '这条请求正在处理中，请稍后重试。'), in_progress: true, operation_id: reserved.operation.operation_id };
+  if (reserved.in_progress) return { ...(await renderErrorResponse(errorResult(turn, 'in_progress', '这条请求正在处理中，请稍后重试。'))), in_progress: true, operation_id: reserved.operation.operation_id };
 
   let operation: import('./protocol').FinanceOperationRecord | undefined;
   try {
@@ -302,11 +430,11 @@ export async function handleFinanceV2Turn(
     const rendered = await renderFinanceResult(draft.result, draft.presentation);
     const committedResult = { ...draft.result, render_hash: rendered.render_hash } as FinanceResult;
     const resultPage = committedResult.kind === 'success' ? committedResult.page : null;
-    const activeResultSetId = draft.result_set_id !== undefined ? draft.result_set_id : session.active_result_set_id;
-    const activeWindowStart = resultPage?.start_ordinal ?? session.active_window_start_ordinal;
-    const activeWindowEnd = resultPage?.end_ordinal ?? session.active_window_end_ordinal;
-    const previousWindowStart = resultPage ? session.active_window_start_ordinal : session.previous_window_start_ordinal;
-    const previousWindowEnd = resultPage ? session.active_window_end_ordinal : session.previous_window_end_ordinal;
+    const activeResultSetId = draft.result_set_id !== undefined ? draft.result_set_id : (compatibilityInterrupted ? null : session.active_result_set_id);
+    const activeWindowStart = resultPage?.start_ordinal ?? (compatibilityInterrupted ? null : session.active_window_start_ordinal);
+    const activeWindowEnd = resultPage?.end_ordinal ?? (compatibilityInterrupted ? null : session.active_window_end_ordinal);
+    const previousWindowStart = resultPage ? (compatibilityInterrupted ? null : session.active_window_start_ordinal) : (compatibilityInterrupted ? null : session.previous_window_start_ordinal);
+    const previousWindowEnd = resultPage ? (compatibilityInterrupted ? null : session.active_window_end_ordinal) : (compatibilityInterrupted ? null : session.previous_window_end_ordinal);
     const deliveryRows = [];
     if (options.telegramDestinationId) {
       const deliveryIdentity = options.delivery?.kind === 'replay'
@@ -354,6 +482,7 @@ export async function handleFinanceV2Turn(
     const sessionStatement = env.DB.prepare(
       `UPDATE finance_sessions
           SET session_version = session_version + 1,
+              compatibility_interrupted = 0,
               active_plan_id = ?, active_plan_version = ?,
               active_result_set_id = ?,
               active_window_start_ordinal = ?, active_window_end_ordinal = ?,
@@ -406,7 +535,8 @@ export async function handleFinanceV2Turn(
     const persisted = await persistErrorResult(
       env,
       turn,
-      errorResult(turn, failure.code, failure.safeMessage, operationType)
+      errorResult(turn, failure.code, failure.safeMessage, operationType),
+      options
     );
     if (operation) await failFinanceOperation(env.DB, operation, message, persisted.result.result_id);
     return {

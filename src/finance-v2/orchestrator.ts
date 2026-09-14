@@ -1,4 +1,4 @@
-import { financeReferencePrompt, loadFinanceReferenceCatalog } from '../finance-reference';
+import { financeReferencePrompt, loadFinanceReferenceCatalog, type FinanceReferenceCatalog } from '../finance-reference';
 import type { Env } from '../types';
 import {
   ProtocolValidationError,
@@ -15,11 +15,13 @@ import {
   type ReferenceSpec,
   type TemporalScope
 } from './protocol';
+import { MAX_CREATE_ENTRIES, MAX_RECEIPT_ITEMS } from './capacity';
 
 interface OrchestratorContext {
   sessionVersion: number;
   activePlan?: FinancePlan | null;
   recentTurnSummaries?: string[];
+  referenceCatalog?: FinanceReferenceCatalog;
   receiptArtifact?: unknown;
   baselinePlan?: unknown;
   requiredOperation?: FinancePlan['operation'];
@@ -28,7 +30,98 @@ interface OrchestratorContext {
 const OPERATIONS = new Set(['create', 'query', 'summarize', 'analyze', 'compare', 'update', 'delete', 'restore', 'receipt_create']);
 const TRANSACTION_TYPES = new Set(['expense', 'income', 'transfer']);
 
-function planResponseSchema(): Record<string, unknown> {
+function catalogReferenceResponseSchema(kind: 'category' | 'account' | 'merchant'): Record<string, unknown> {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['kind', 'value'],
+    properties: {
+      kind: { const: kind },
+      value: { type: 'string', minLength: 1, maxLength: 256 }
+    }
+  };
+}
+
+function temporalScopeResponseSchema(): Record<string, unknown> {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['from', 'to', 'timezone', 'end_exclusive'],
+    properties: {
+      from: { type: 'string', minLength: 1, maxLength: 64 },
+      to: { type: 'string', minLength: 1, maxLength: 64 },
+      timezone: { const: 'Asia/Shanghai' },
+      end_exclusive: { const: true },
+      source_phrase: { type: ['string', 'null'], maxLength: 256 }
+    }
+  };
+}
+
+function referenceObjectResponseSchema(): Record<string, unknown> {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['kind'],
+    properties: {
+      kind: {
+        enum: ['result_ordinal', 'result_window', 'operation', 'receipt', 'transaction', 'transaction_item', 'session_semantic']
+      },
+      result_set_id: { type: 'string', minLength: 1, maxLength: 128 },
+      ordinal: { type: 'integer', minimum: 1 },
+      window_start_ordinal: { type: 'integer', minimum: 1 },
+      window_end_ordinal: { type: 'integer', minimum: 1 },
+      result_set_version: { type: 'integer', minimum: 1 },
+      operation_id: { type: 'string', minLength: 1, maxLength: 128 },
+      receipt_artifact_id: { type: 'string', minLength: 1, maxLength: 256 },
+      transaction_id: { type: 'string', minLength: 1, maxLength: 128 },
+      item_id: { type: 'string', minLength: 1, maxLength: 128 },
+      semantic_key: {
+        enum: ['last_created', 'last_updated', 'last_deleted', 'last_restored', 'last_receipt', 'active_result_set', 'previous_result_set', 'active_window', 'previous_window']
+      }
+    }
+  };
+}
+
+export function planResponseSchema(): Record<string, unknown> {
+  const temporalScope = temporalScopeResponseSchema();
+  const referenceObject = referenceObjectResponseSchema();
+  const reference = {
+    oneOf: [
+      { type: 'null' },
+      referenceObject
+    ]
+  };
+  const presentation = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      mode: { enum: ['details', 'summary', 'analysis', 'comparison'] },
+      fields: {
+        type: 'array',
+        maxItems: 20,
+        items: { enum: ['date', 'time', 'item', 'amount', 'category', 'account', 'merchant', 'type'] }
+      },
+      sort_field: { enum: ['occurred_at', 'amount', 'item', 'category', 'account'] },
+      sort_direction: { enum: ['asc', 'desc'] },
+      group_by: { enum: ['none', 'date', 'category', 'account', 'merchant'] },
+      page_size: { type: 'integer', minimum: 1, maximum: 20 },
+      page_token: { type: ['string', 'null'], maxLength: 256 },
+      compact: { type: 'boolean' }
+    }
+  };
+  const filters = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      types: { type: 'array', maxItems: 3, items: { enum: ['expense', 'income', 'transfer'] } },
+      categories: { type: 'array', maxItems: 20, items: catalogReferenceResponseSchema('category') },
+      accounts: { type: 'array', maxItems: 20, items: catalogReferenceResponseSchema('account') },
+      merchant_text: { type: ['string', 'null'], maxLength: 128 },
+      semantic_text: { type: ['string', 'null'], maxLength: 256 },
+      amount_min_fen: { type: ['integer', 'null'], minimum: 0 },
+      amount_max_fen: { type: ['integer', 'null'], minimum: 0 }
+    }
+  };
   const planSchema = {
     type: 'object',
     additionalProperties: false,
@@ -45,20 +138,20 @@ function planResponseSchema(): Record<string, unknown> {
       ledger_scope_id: { const: 'personal:primary' },
       operation: { enum: [...OPERATIONS] },
       confidence: { type: 'number', minimum: 0, maximum: 1 },
-      presentation: { type: 'object' },
-      temporal_scope: { type: ['object', 'null'] },
-      filters: { type: 'object' },
-      entries: { type: 'array', maxItems: 100 },
+      presentation,
+      temporal_scope: { oneOf: [temporalScope, { type: 'null' }] },
+      filters,
+      entries: { type: 'array', maxItems: MAX_CREATE_ENTRIES },
       selection: { type: 'object' },
       changes: { type: 'object' },
-      reference: { type: 'object' },
+      reference,
       receipt_job_id: { type: 'string', minLength: 1, maxLength: 256 },
       receipt_artifact_id: { type: 'string', minLength: 1, maxLength: 256 },
       receipt_merchant: { type: ['string', 'null'], maxLength: 160 },
       receipt_total_fen: { type: 'integer', minimum: 1 },
-      receipt_item_count: { type: 'integer', minimum: 1, maximum: 200 },
-      left_scope: { type: 'object' },
-      right_scope: { type: 'object' },
+      receipt_item_count: { type: 'integer', minimum: 1, maximum: MAX_RECEIPT_ITEMS },
+      left_scope: temporalScope,
+      right_scope: temporalScope,
       metric: { type: 'string' },
       dimension: { type: 'string' }
     }
@@ -79,12 +172,12 @@ function planResponseSchema(): Record<string, unknown> {
       base_plan_version: { type: 'integer', minimum: 1 },
       base_session_version: { type: 'integer', minimum: 0 },
       operation: { type: 'object', additionalProperties: false, required: ['op', 'value'], properties: { op: { const: 'replace' }, value: { enum: [...OPERATIONS] } } },
-      temporal_scope: replaceOrClear({ type: 'object' }),
-      filters: replaceOrClear({ type: 'object' }),
+      temporal_scope: replaceOrClear(temporalScope),
+      filters: replaceOrClear(filters),
       selection: replaceOrClear({ type: 'object' }),
       changes: replaceOrClear({ type: 'object' }),
-      presentation: replaceOrClear({ type: 'object' }),
-      reference: replaceOrClear({ type: 'object' })
+      presentation: replaceOrClear(presentation),
+      reference: replaceOrClear(referenceObject)
     }
   };
   return {
@@ -130,6 +223,144 @@ function planResponseSchema(): Record<string, unknown> {
       }
     ]
   };
+}
+
+function planOnlyResponseSchema(): Record<string, unknown> {
+  const schema = planResponseSchema();
+  const variants = schema.oneOf;
+  if (!Array.isArray(variants) || !variants[0] || typeof variants[0] !== 'object' || Array.isArray(variants[0])) {
+    throw new Error('FINANCE_PLAN_SCHEMA_INVALID');
+  }
+  return variants[0] as Record<string, unknown>;
+}
+
+function createEntryResponseSchema(): Record<string, unknown> {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['client_entry_key', 'type', 'money', 'occurred_at', 'category', 'description'],
+    properties: {
+      client_entry_key: { type: 'string', minLength: 1, maxLength: 128 },
+      type: { enum: ['expense', 'income', 'transfer'] },
+      money: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['amount_fen', 'currency'],
+        properties: {
+          amount_fen: { type: 'integer', minimum: 1 },
+          currency: { const: 'CNY' }
+        }
+      },
+      occurred_at: { type: 'string', minLength: 1, maxLength: 64 },
+      account: {
+        oneOf: [
+          { type: 'null' },
+          catalogReferenceResponseSchema('account')
+        ]
+      },
+      category: catalogReferenceResponseSchema('category'),
+      merchant: { type: ['string', 'null'], maxLength: 256 },
+      description: { type: 'string', minLength: 1, maxLength: 512 },
+      items: {
+        type: 'array',
+        maxItems: MAX_RECEIPT_ITEMS,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['client_item_key', 'name', 'quantity', 'line_total_fen', 'category', 'confidence'],
+          properties: {
+            client_item_key: { type: 'string', minLength: 1, maxLength: 128 },
+            name: { type: 'string', minLength: 1, maxLength: 160 },
+            quantity: { type: 'number', exclusiveMinimum: 0, maximum: 10000 },
+            unit_price_fen: { type: ['integer', 'null'], minimum: 0 },
+            line_total_fen: { type: 'integer', minimum: 0 },
+            category: { type: 'string', minLength: 1, maxLength: 64 },
+            confidence: { type: 'number', minimum: 0, maximum: 1 }
+          }
+        }
+      }
+    }
+  };
+}
+
+function constrainedCreatePlanSchema(
+  operation: 'create' | 'receipt_create',
+  turn: FinanceTurn,
+  sessionVersion: number
+): Record<string, unknown> {
+  const base = planOnlyResponseSchema();
+  const baseProperties = base.properties as Record<string, unknown>;
+  const allowedKeys = [
+    'schema_version',
+    'plan_id',
+    'plan_version',
+    'base_session_version',
+    'source_turn_id',
+    'ledger_scope_id',
+    'confidence',
+    'presentation',
+    'operation',
+    'entries'
+  ];
+  if (operation === 'receipt_create') {
+    allowedKeys.push(
+      'receipt_job_id',
+      'receipt_artifact_id',
+      'receipt_merchant',
+      'receipt_total_fen',
+      'receipt_item_count'
+    );
+  }
+  const properties: Record<string, unknown> = {};
+  for (const key of allowedKeys) properties[key] = baseProperties[key];
+  properties.base_session_version = { const: sessionVersion };
+  properties.source_turn_id = { const: turn.turn_id };
+  properties.operation = { const: operation };
+  properties.entries = {
+    type: 'array',
+    minItems: 1,
+    maxItems: MAX_CREATE_ENTRIES,
+    items: createEntryResponseSchema()
+  };
+  const required = Array.from(new Set([
+    ...((base.required as string[]) || []),
+    'operation',
+    'entries'
+  ]));
+  if (operation === 'receipt_create') required.push('receipt_job_id', 'receipt_artifact_id');
+  return { ...base, required, properties };
+}
+
+function responseSchemaForTurn(
+  turn: FinanceTurn,
+  requiredOperation: FinanceOperationType | undefined,
+  sessionVersion: number
+): Record<string, unknown> {
+  if (requiredOperation === 'receipt_create') return constrainedCreatePlanSchema('receipt_create', turn, sessionVersion);
+  return planOnlyResponseSchema();
+}
+
+function localDateForTurn(turn: FinanceTurn): string {
+  const eventDate = new Date(turn.event_time);
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: turn.timezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }).formatToParts(eventDate);
+    const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    if (values.year && values.month && values.day) return `${values.year}-${values.month}-${values.day}`;
+  } catch {
+    // Fall through to the UTC date of the already validated event time.
+  }
+  return `${eventDate.getUTCFullYear()}-${String(eventDate.getUTCMonth() + 1).padStart(2, '0')}-${String(eventDate.getUTCDate()).padStart(2, '0')}`;
+}
+
+function nextLocalDate(dateText: string): string {
+  const [year, month, day] = dateText.split('-').map(Number);
+  const next = new Date(Date.UTC(year, month - 1, day + 1));
+  return `${next.getUTCFullYear()}-${String(next.getUTCMonth() + 1).padStart(2, '0')}-${String(next.getUTCDate()).padStart(2, '0')}`;
 }
 
 function objectValue(value: unknown, code: string): Record<string, unknown> {
@@ -453,7 +684,7 @@ function validateTemporalScope(value: unknown): TemporalScope {
 
 function validateCreateItems(value: unknown): CreateItem[] {
   if (value === undefined || value === null) return [];
-  if (!Array.isArray(value) || value.length > 200) throw new ProtocolValidationError('invalid_item_count', 'item count exceeds 200');
+  if (!Array.isArray(value) || value.length > MAX_RECEIPT_ITEMS) throw new ProtocolValidationError('invalid_item_count', `item count exceeds ${MAX_RECEIPT_ITEMS}`);
   return value.map((raw) => {
     const item = objectValue(raw, 'invalid_item');
     const quantity = Number(item.quantity);
@@ -496,7 +727,7 @@ export function validateFinancePlan(value: unknown, turn: FinanceTurn): FinanceP
     if (operation === 'receipt_create' && turn.channel !== 'receipt') {
       throw new ProtocolValidationError('invalid_receipt_plan', 'receipt_create is reserved for receipt turns');
     }
-    if (!Array.isArray(source.entries) || source.entries.length < 1 || source.entries.length > 100) throw new ProtocolValidationError('invalid_create_entries', 'create requires 1..100 entries');
+    if (!Array.isArray(source.entries) || source.entries.length < 1 || source.entries.length > MAX_CREATE_ENTRIES) throw new ProtocolValidationError('invalid_create_entries', `create requires 1..${MAX_CREATE_ENTRIES} entries`);
     const entries = source.entries.map((raw) => {
       const entry = objectValue(raw, 'invalid_create_entry');
       const type = stringValue(entry.type, 'invalid_transaction_type');
@@ -518,7 +749,7 @@ export function validateFinancePlan(value: unknown, turn: FinanceTurn): FinanceP
     });
     if (operation === 'receipt_create') {
       const receiptItemCount = source.receipt_item_count === undefined ? undefined : integerValue(source.receipt_item_count, 'invalid_item_count', 1);
-      if (receiptItemCount !== undefined && receiptItemCount > 200) throw new ProtocolValidationError('invalid_item_count', 'receipt item count exceeds 200');
+      if (receiptItemCount !== undefined && receiptItemCount > MAX_RECEIPT_ITEMS) throw new ProtocolValidationError('invalid_item_count', `receipt item count exceeds ${MAX_RECEIPT_ITEMS}`);
       const receiptPlan: Record<string, unknown> = {
         ...base,
         operation: 'receipt_create',
@@ -632,19 +863,28 @@ export async function interpretFinanceTurn(
   const mockPlan = (env as unknown as { __mockFinancePlan?: unknown }).__mockFinancePlan;
   if (mockPlan !== undefined) {
     const mockEnvelope = mockPlan && typeof mockPlan === 'object' ? mockPlan as Record<string, unknown> : null;
-    const plan = mockEnvelope?.kind === 'patch_plan'
-      ? context.activePlan
-        ? applyFinancePlanPatch(context.activePlan, mockEnvelope.patch, turn)
-        : (() => { throw new ProtocolValidationError('ordering_conflict', 'patch plan requires an active plan'); })()
-      : mockEnvelope?.kind === 'new_plan'
-        ? validateFinancePlan(mockEnvelope.plan, turn)
-        : validateFinancePlan(mockPlan, turn);
+    let plan: FinancePlan;
+    if (mockEnvelope?.kind === 'patch_plan') {
+      if (!context.activePlan) throw new ProtocolValidationError('ordering_conflict', 'patch plan requires an active plan');
+      plan = applyFinancePlanPatch(context.activePlan, mockEnvelope.patch, turn);
+    } else if (mockEnvelope?.kind === 'new_plan') {
+      plan = validateFinancePlan(mockEnvelope.plan, turn);
+    } else if (mockEnvelope?.kind === 'clarification') {
+      const clarification = objectValue(mockEnvelope.clarification, 'clarification_required');
+      throw new ProtocolValidationError('clarification_required', stringValue(clarification.message, 'clarification_required'));
+    } else if (mockEnvelope?.kind === 'non_finance') {
+      throw new ProtocolValidationError('non_finance', 'not a finance request');
+    } else {
+      plan = validateFinancePlan(mockPlan, turn);
+    }
     if (context.requiredOperation && plan.operation !== context.requiredOperation) throw new ProtocolValidationError('invalid_receipt_plan', 'mock plan changed the required receipt operation');
     if (context.requiredOperation === 'receipt_create' && context.baselinePlan) assertReceiptPlanFidelity(plan, context.baselinePlan, turn);
     return plan;
   }
   if (!turn.text?.trim()) throw new ProtocolValidationError('interpretation_failed', 'natural-language turn has no text');
-  const catalog = await loadFinanceReferenceCatalog(env);
+  const catalog = context.referenceCatalog || await loadFinanceReferenceCatalog(env);
+  const referenceLocalDate = localDateForTurn(turn);
+  const followingLocalDate = nextLocalDate(referenceLocalDate);
   const result = await env.AI.run(env.AI_MODEL, {
     messages: [
       {
@@ -654,6 +894,10 @@ export async function interpretFinanceTurn(
           '只输出符合 JSON Schema 的 FinancePlan 或 OrchestratorOutput，不执行数据库操作，不声称任何事实，不猜测缺失金额或目标。',
           '支持 create/query/summarize/analyze/compare/update/delete/restore；有歧义时不要替用户选择不存在的目标，返回可被上层识别的低置信度计划。',
           '所有金额使用整数分、货币只能 CNY；时间使用 Asia/Shanghai 的 ISO date-time；账户和分类只能从当前目录中选择。',
+          `当前消息的 Asia/Shanghai 本地日期=${referenceLocalDate}（event_time=${turn.event_time}；相对时间必须以此为准，不能使用 received_time）。`,
+          `若用户说“今天/今日”，必须把 temporal_scope 完整展开为 {"from":"${referenceLocalDate}T00:00:00+08:00","to":"${followingLocalDate}T00:00:00+08:00","timezone":"Asia/Shanghai","end_exclusive":true,"source_phrase":"今天"}；禁止输出 {"type":"today"}、{"date":"today"} 或其他未展开的相对日期结构。`,
+          'query/summarize/analyze/compare 必须填写完整的时间范围字段（compare 要填写 left_scope 和 right_scope）；没有结果集引用时 reference 必须是 null。用户说“支出”时 filters.types 必须包含 expense；“明细/账单/记录”时 query 的 presentation.mode 使用 details。',
+          '只能输出协议字段：不要输出 action、query_type、date、currency、unit 等旧版或自定义字段；不要把空对象 {} 当作 reference。',
           `当前 session_version=${context.sessionVersion}，当前 turn_id=${turn.turn_id}。`,
           financeReferencePrompt(catalog),
           context.activePlan ? `上一个结构化计划：${JSON.stringify(context.activePlan)}` : '没有可继承的上一计划。',
@@ -665,7 +909,8 @@ export async function interpretFinanceTurn(
       },
       { role: 'user', content: turn.text }
     ],
-    response_format: { type: 'json_schema', json_schema: planResponseSchema() }
+    max_tokens: 1024,
+    response_format: { type: 'json_schema', json_schema: responseSchemaForTurn(turn, context.requiredOperation, context.sessionVersion) }
   });
   const parsed = parseAiResponse(result) as Record<string, unknown> | null;
   let plan: FinancePlan;

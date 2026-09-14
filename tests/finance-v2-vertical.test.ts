@@ -57,7 +57,7 @@ const pageToken = await createPageToken('test-secret', {
   result_set_version: 1,
   next_start_ordinal: 3,
   page_size: 2,
-  expires_at: '2026-09-08T12:00:00.000Z'
+  expires_at: '2099-01-01T00:00:00.000Z'
 });
 const decoded = await verifyPageToken('test-secret', pageToken, {
   ledger_scope_id: 'personal:primary',
@@ -91,7 +91,7 @@ const window = resultSetWindow({
     row_snapshot_bytes: 2
   })),
   created_at: '2026-09-07T12:00:00.000Z',
-  expires_at: '2026-09-08T12:00:00.000Z'
+  expires_at: '2099-01-01T00:00:00.000Z'
 }, 3, 2);
 assert.deepEqual(window.items.map((item) => item.ordinal), [3]);
 assert.equal(window.has_previous, true);
