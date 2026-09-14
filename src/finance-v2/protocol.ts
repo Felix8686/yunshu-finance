@@ -117,6 +117,7 @@ export interface FinanceFilters {
   categories?: CatalogReference[];
   accounts?: CatalogReference[];
   merchant_text?: string | null;
+  semantic_search?: boolean;
   semantic_text?: string | null;
   amount_min_fen?: number | null;
   amount_max_fen?: number | null;

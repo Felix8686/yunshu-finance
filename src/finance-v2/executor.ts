@@ -21,7 +21,7 @@ import {
 } from './protocol';
 import { buildResultSetSnapshot, createPageToken, resultSetWindow, verifyPageToken } from './result-set';
 import { buildResultSetStatements, loadResultSetSnapshot } from './persistence';
-import { MAX_ANALYSIS_DIMENSIONS, MAX_D1_BATCH_STATEMENTS, MAX_MUTATION_TARGETS } from './capacity';
+import { MAX_ANALYSIS_DIMENSIONS, MAX_D1_BATCH_STATEMENTS, MAX_MUTATION_TARGETS, MAX_RESULT_SET_ROWS } from './capacity';
 
 interface TransactionRow {
   id: string;
@@ -130,17 +130,14 @@ async function loadItems(env: Env, transactionIds: string[]): Promise<Map<string
   return grouped;
 }
 
-async function queryTransactions(
-  env: Env,
-  filters: FinanceFilters,
-  temporalScope: TemporalScope | null | undefined,
-  presentation?: FinancePresentation
-): Promise<{ rows: TransactionRow[]; items: Map<string, TransactionItemRow[]> }> {
+function transactionWhere(filters: FinanceFilters, temporalScope: TemporalScope | null | undefined): { sql: string; params: unknown[] } {
   const where: string[] = ['1 = 1'];
   const params: unknown[] = [];
   if (temporalScope) {
-    where.push('t.occurred_at >= ? AND t.occurred_at < ?');
-    params.push(temporalScope.from, temporalScope.to);
+    // Ledger timestamps are historically stored as local ISO strings without an offset;
+    // compare the Asia/Shanghai calendar date so both legacy and offset-bearing rows match.
+    where.push('substr(t.occurred_at, 1, 10) >= ? AND substr(t.occurred_at, 1, 10) < ?');
+    params.push(temporalScope.from.slice(0, 10), temporalScope.to.slice(0, 10));
   }
   if (filters.types?.length) {
     where.push(`t.type IN (${filters.types.map(() => '?').join(', ')})`);
@@ -154,12 +151,12 @@ async function queryTransactions(
     where.push(`a.name IN (${filters.accounts.map(() => '?').join(', ')})`);
     params.push(...filters.accounts.map((item) => item.value));
   }
-  if (filters.merchant_text) {
+  if (filters.merchant_text?.trim()) {
     where.push('COALESCE(t.merchant, \'\') LIKE ?');
-    params.push(`%${filters.merchant_text}%`);
+    params.push(`%${filters.merchant_text.trim()}%`);
   }
-  if (filters.semantic_text) {
-    const semanticLike = `%${filters.semantic_text}%`;
+  if (filters.semantic_search && filters.semantic_text?.trim()) {
+    const semanticLike = `%${filters.semantic_text.trim()}%`;
     where.push(`(
       COALESCE(t.description, '') LIKE ?
       OR COALESCE(t.merchant, '') LIKE ?
@@ -180,6 +177,16 @@ async function queryTransactions(
     where.push('t.amount_fen <= ?');
     params.push(filters.amount_max_fen);
   }
+  return { sql: where.join(' AND '), params };
+}
+
+async function queryTransactions(
+  env: Env,
+  filters: FinanceFilters,
+  temporalScope: TemporalScope | null | undefined,
+  presentation?: FinancePresentation
+): Promise<{ rows: TransactionRow[]; items: Map<string, TransactionItemRow[]> }> {
+  const filter = transactionWhere(filters, temporalScope);
   const sortColumn = presentation?.sort_field === 'amount'
     ? 't.amount_fen'
     : presentation?.sort_field === 'item'
@@ -197,10 +204,10 @@ async function queryTransactions(
        FROM transactions t
        LEFT JOIN accounts a ON a.id = t.account_id
        LEFT JOIN categories c ON c.id = t.category_id
-      WHERE ${where.join(' AND ')}
+      WHERE ${filter.sql}
       ORDER BY ${sortColumn} ${sortDirection}, t.occurred_at DESC, t.id DESC
-      LIMIT 200`
-  ).bind(...params).all<TransactionRow>();
+      LIMIT ?`
+  ).bind(...filter.params, MAX_RESULT_SET_ROWS).all<TransactionRow>();
   const normalized = rows.results || [];
   return { rows: normalized, items: await loadItems(env, normalized.map((row) => row.id)) };
 }
@@ -273,20 +280,42 @@ async function resultRows(rows: TransactionRow[], items: Map<string, Transaction
   return output;
 }
 
-function summary(rows: TransactionRow[]): FinanceSummary {
-  let expense = 0;
-  let income = 0;
-  let transfer = 0;
-  for (const row of rows) {
-    if (row.type === 'expense') expense += row.amount_fen;
-    else if (row.type === 'income') income += row.amount_fen;
-    else transfer += row.amount_fen;
-  }
+interface SummaryAggregateRow {
+  transaction_count?: number | string;
+  expense_fen?: number | string;
+  income_fen?: number | string;
+  transfer_fen?: number | string;
+}
+
+interface DimensionAggregateRow {
+  dimension_key?: string | null;
+  value_fen?: number | string;
+  transaction_count?: number | string;
+}
+
+async function aggregateSummary(
+  env: Env,
+  filters: FinanceFilters,
+  temporalScope: TemporalScope | null | undefined
+): Promise<FinanceSummary> {
+  const filter = transactionWhere(filters, temporalScope);
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) AS transaction_count,
+            COALESCE(SUM(CASE WHEN t.type = 'expense' THEN t.amount_fen ELSE 0 END), 0) AS expense_fen,
+            COALESCE(SUM(CASE WHEN t.type = 'income' THEN t.amount_fen ELSE 0 END), 0) AS income_fen,
+            COALESCE(SUM(CASE WHEN t.type = 'transfer' THEN t.amount_fen ELSE 0 END), 0) AS transfer_fen
+       FROM transactions t
+       LEFT JOIN accounts a ON a.id = t.account_id
+       LEFT JOIN categories c ON c.id = t.category_id
+      WHERE ${filter.sql}`
+  ).bind(...filter.params).first<SummaryAggregateRow>();
+  const expense = Number(row?.expense_fen || 0);
+  const income = Number(row?.income_fen || 0);
   return {
-    transaction_count: rows.length,
+    transaction_count: Number(row?.transaction_count || 0),
     expense_fen: expense,
     income_fen: income,
-    transfer_fen: transfer,
+    transfer_fen: Number(row?.transfer_fen || 0),
     net_fen: income - expense
   };
 }
@@ -306,34 +335,47 @@ function baseResult(plan: FinancePlan, operation: FinanceResult['operation']): R
   };
 }
 
-function dimensionValue(row: TransactionRow, dimension: string): string {
-  if (dimension === 'date') return row.occurred_at.slice(0, 10);
-  if (dimension === 'category') return row.category_name || '未分类';
-  if (dimension === 'account') return row.account_name || '未指定';
-  if (dimension === 'merchant') return row.merchant || '未识别商家';
-  return 'all';
+function dimensionSql(dimension: string): string {
+  if (dimension === 'date') return 'substr(t.occurred_at, 1, 10)';
+  if (dimension === 'category') return "COALESCE(c.name, '未分类')";
+  if (dimension === 'account') return "COALESCE(a.name, '未指定')";
+  if (dimension === 'merchant') return "COALESCE(t.merchant, '未识别商家')";
+  return "'all'";
 }
 
-function metricValue(row: TransactionRow, metric: string): number {
-  if (metric === 'count') return 1;
-  if (metric === 'income') return row.type === 'income' ? row.amount_fen : 0;
-  if (metric === 'net') return row.type === 'income' ? row.amount_fen : row.type === 'expense' ? -row.amount_fen : 0;
-  return row.type === 'expense' ? row.amount_fen : 0;
+function metricSql(metric: string): string {
+  if (metric === 'count') return 'COUNT(*)';
+  if (metric === 'income') return "COALESCE(SUM(CASE WHEN t.type = 'income' THEN t.amount_fen ELSE 0 END), 0)";
+  if (metric === 'net') return "COALESCE(SUM(CASE WHEN t.type = 'income' THEN t.amount_fen WHEN t.type = 'expense' THEN -t.amount_fen ELSE 0 END), 0)";
+  return "COALESCE(SUM(CASE WHEN t.type = 'expense' THEN t.amount_fen ELSE 0 END), 0)";
 }
 
-function analysisDimensions(rows: TransactionRow[], metric: string, dimension: string): Array<{ key: string; value_fen: number; count: number }> {
-  const map = new Map<string, { value_fen: number; count: number }>();
-  for (const row of rows) {
-    const key = dimensionValue(row, dimension);
-    const current = map.get(key) || { value_fen: 0, count: 0 };
-    current.value_fen += metricValue(row, metric);
-    current.count += 1;
-    map.set(key, current);
-  }
-  return [...map.entries()]
-    .sort((a, b) => b[1].value_fen - a[1].value_fen || a[0].localeCompare(b[0]))
-    .slice(0, MAX_ANALYSIS_DIMENSIONS)
-    .map(([key, value]) => ({ key, ...value }));
+async function analysisDimensions(
+  env: Env,
+  filters: FinanceFilters,
+  temporalScope: TemporalScope | null | undefined,
+  metric: string,
+  dimension: string
+): Promise<Array<{ key: string; value_fen: number; count: number }>> {
+  const filter = transactionWhere(filters, temporalScope);
+  const dimensionExpression = dimensionSql(dimension);
+  const groupBy = dimension === 'none' ? '' : ` GROUP BY ${dimensionExpression}`;
+  const rows = await env.DB.prepare(
+    `SELECT ${dimensionExpression} AS dimension_key,
+            ${metricSql(metric)} AS value_fen,
+            COUNT(*) AS transaction_count
+       FROM transactions t
+       LEFT JOIN accounts a ON a.id = t.account_id
+       LEFT JOIN categories c ON c.id = t.category_id
+      WHERE ${filter.sql}${groupBy}
+      ORDER BY value_fen DESC, dimension_key ASC
+      LIMIT ?`
+  ).bind(...filter.params, MAX_ANALYSIS_DIMENSIONS).all<DimensionAggregateRow>();
+  return (rows.results || []).map((row) => ({
+    key: row.dimension_key || '未分类',
+    value_fen: Number(row.value_fen || 0),
+    count: Number(row.transaction_count || 0)
+  }));
 }
 
 function summaryMetric(value: FinanceSummary, metric: string): number {
@@ -562,19 +604,19 @@ async function buildReadDraft(env: Env, plan: QueryPlan | Extract<FinancePlan, {
       : null
   };
   if (window.has_next && !page.next_page_token) throw new Error('PAGE_TOKEN_SECRET_NOT_CONFIGURED');
-  const calculated = summary(queried.rows);
+  const calculated = await aggregateSummary(env, plan.filters, temporalScope);
   let analysis: Record<string, unknown> | undefined;
   let comparison: Record<string, unknown> | undefined;
   if (plan.operation === 'analyze') {
     analysis = {
       metric: plan.metric,
+      dimension: plan.dimension,
       summary: calculated,
-      dimensions: analysisDimensions(queried.rows, plan.metric, plan.dimension)
+      dimensions: await analysisDimensions(env, plan.filters, temporalScope, plan.metric, plan.dimension)
     };
   }
   if (plan.operation === 'compare') {
-    const right = await queryTransactions(env, plan.filters, plan.right_scope, plan.presentation);
-    const rightSummary = summary(right.rows);
+    const rightSummary = await aggregateSummary(env, plan.filters, plan.right_scope);
     const leftValue = summaryMetric(calculated, plan.metric);
     const rightValue = summaryMetric(rightSummary, plan.metric);
     comparison = {

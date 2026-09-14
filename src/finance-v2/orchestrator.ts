@@ -117,6 +117,7 @@ export function planResponseSchema(): Record<string, unknown> {
       categories: { type: 'array', maxItems: 20, items: catalogReferenceResponseSchema('category') },
       accounts: { type: 'array', maxItems: 20, items: catalogReferenceResponseSchema('account') },
       merchant_text: { type: ['string', 'null'], maxLength: 128 },
+      semantic_search: { type: 'boolean', description: 'Set true only for an explicit keyword search over descriptions, merchants, categories, or items.' },
       semantic_text: { type: ['string', 'null'], maxLength: 256 },
       amount_min_fen: { type: ['integer', 'null'], minimum: 0 },
       amount_max_fen: { type: ['integer', 'null'], minimum: 0 }
@@ -357,10 +358,100 @@ function localDateForTurn(turn: FinanceTurn): string {
   return `${eventDate.getUTCFullYear()}-${String(eventDate.getUTCMonth() + 1).padStart(2, '0')}-${String(eventDate.getUTCDate()).padStart(2, '0')}`;
 }
 
-function nextLocalDate(dateText: string): string {
+type RelativeTemporalScopeKey = 'today' | 'yesterday' | 'this_month' | 'last_month';
+
+const RELATIVE_SCOPE_SOURCE_PHRASES: Record<string, RelativeTemporalScopeKey> = {
+  today: 'today',
+  '今天': 'today',
+  '今日': 'today',
+  yesterday: 'yesterday',
+  '昨天': 'yesterday',
+  '昨日': 'yesterday',
+  this_month: 'this_month',
+  '本月': 'this_month',
+  '这个月': 'this_month',
+  '当月': 'this_month',
+  last_month: 'last_month',
+  '上个月': 'last_month',
+  '上月': 'last_month'
+};
+
+function shiftLocalDate(dateText: string, days: number): string {
   const [year, month, day] = dateText.split('-').map(Number);
-  const next = new Date(Date.UTC(year, month - 1, day + 1));
-  return `${next.getUTCFullYear()}-${String(next.getUTCMonth() + 1).padStart(2, '0')}-${String(next.getUTCDate()).padStart(2, '0')}`;
+  const shifted = new Date(Date.UTC(year, month - 1, day + days));
+  return `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, '0')}-${String(shifted.getUTCDate()).padStart(2, '0')}`;
+}
+
+function monthStart(year: number, month: number, offset: number): string {
+  const shifted = new Date(Date.UTC(year, month - 1 + offset, 1));
+  return `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, '0')}-01`;
+}
+
+function nextLocalDate(dateText: string): string {
+  return shiftLocalDate(dateText, 1);
+}
+
+function startOfDay(dateText: string): string {
+  return `${dateText}T00:00:00+08:00`;
+}
+
+function relativeScope(fromDate: string, toDate: string, sourcePhrase: string): TemporalScope {
+  return {
+    from: startOfDay(fromDate),
+    to: startOfDay(toDate),
+    timezone: 'Asia/Shanghai',
+    end_exclusive: true,
+    source_phrase: sourcePhrase
+  };
+}
+
+export function relativeTemporalScopesForTurn(turn: FinanceTurn): Record<RelativeTemporalScopeKey, TemporalScope> {
+  const localDate = localDateForTurn(turn);
+  const [year, month] = localDate.split('-').map(Number);
+  const currentMonthStart = monthStart(year, month, 0);
+  return {
+    today: relativeScope(localDate, nextLocalDate(localDate), '今天'),
+    yesterday: relativeScope(shiftLocalDate(localDate, -1), localDate, '昨天'),
+    this_month: relativeScope(currentMonthStart, monthStart(year, month, 1), '本月'),
+    last_month: relativeScope(monthStart(year, month, -1), currentMonthStart, '上个月')
+  };
+}
+
+function normalizeRelativeTemporalScope(scope: TemporalScope, turn: FinanceTurn): TemporalScope {
+  const key = scope.source_phrase ? RELATIVE_SCOPE_SOURCE_PHRASES[scope.source_phrase.trim()] : undefined;
+  if (!key) return scope;
+  return {
+    ...relativeTemporalScopesForTurn(turn)[key],
+    source_phrase: scope.source_phrase
+  };
+}
+
+function normalizeFinancePlanRelativeTemporalScopes(plan: FinancePlan, turn: FinanceTurn): FinancePlan {
+  if (plan.operation === 'query' || plan.operation === 'summarize' || plan.operation === 'analyze') {
+    return {
+      ...plan,
+      ...(plan.temporal_scope ? { temporal_scope: normalizeRelativeTemporalScope(plan.temporal_scope, turn) } : {})
+    } as FinancePlan;
+  }
+  if (plan.operation === 'compare') {
+    return {
+      ...plan,
+      left_scope: normalizeRelativeTemporalScope(plan.left_scope, turn),
+      right_scope: normalizeRelativeTemporalScope(plan.right_scope, turn)
+    };
+  }
+  return plan;
+}
+
+function patchReplacesTemporalScope(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const temporalScope = (value as Record<string, unknown>).temporal_scope;
+  return Boolean(
+    temporalScope
+    && typeof temporalScope === 'object'
+    && !Array.isArray(temporalScope)
+    && (temporalScope as Record<string, unknown>).op === 'replace'
+  );
 }
 
 function objectValue(value: unknown, code: string): Record<string, unknown> {
@@ -435,7 +526,16 @@ function validateFilters(value: unknown): FinanceFilters {
     result.types = filters.types as FinanceFilters['types'];
   }
   if (filters.merchant_text !== undefined) result.merchant_text = filters.merchant_text === null ? null : String(filters.merchant_text).slice(0, 128);
-  if (filters.semantic_text !== undefined) result.semantic_text = filters.semantic_text === null ? null : String(filters.semantic_text).slice(0, 256);
+  if (filters.semantic_search !== undefined && typeof filters.semantic_search !== 'boolean') throw new ProtocolValidationError('invalid_filters', 'semantic_search must be boolean');
+  const semanticSearch = filters.semantic_search === true;
+  const semanticText = filters.semantic_text === undefined || filters.semantic_text === null
+    ? null
+    : stringValue(filters.semantic_text, 'invalid_filters').slice(0, 256);
+  if (semanticSearch && !semanticText) throw new ProtocolValidationError('invalid_filters', 'semantic_search requires semantic_text');
+  if (semanticSearch) {
+    result.semantic_search = true;
+    result.semantic_text = semanticText;
+  }
   if (filters.amount_min_fen !== undefined && filters.amount_min_fen !== null) result.amount_min_fen = integerValue(filters.amount_min_fen, 'invalid_money', 0);
   if (filters.amount_max_fen !== undefined && filters.amount_max_fen !== null) result.amount_max_fen = integerValue(filters.amount_max_fen, 'invalid_money', 0);
   if (typeof result.amount_min_fen === 'number' && typeof result.amount_max_fen === 'number' && result.amount_min_fen > result.amount_max_fen) throw new ProtocolValidationError('invalid_money', 'minimum amount exceeds maximum amount');
@@ -864,8 +964,10 @@ export async function interpretFinanceTurn(
   if (mockPlan !== undefined) {
     const mockEnvelope = mockPlan && typeof mockPlan === 'object' ? mockPlan as Record<string, unknown> : null;
     let plan: FinancePlan;
+    let normalizeRelativeScopes = true;
     if (mockEnvelope?.kind === 'patch_plan') {
       if (!context.activePlan) throw new ProtocolValidationError('ordering_conflict', 'patch plan requires an active plan');
+      normalizeRelativeScopes = patchReplacesTemporalScope(mockEnvelope.patch);
       plan = applyFinancePlanPatch(context.activePlan, mockEnvelope.patch, turn);
     } else if (mockEnvelope?.kind === 'new_plan') {
       plan = validateFinancePlan(mockEnvelope.plan, turn);
@@ -877,9 +979,12 @@ export async function interpretFinanceTurn(
     } else {
       plan = validateFinancePlan(mockPlan, turn);
     }
-    if (context.requiredOperation && plan.operation !== context.requiredOperation) throw new ProtocolValidationError('invalid_receipt_plan', 'mock plan changed the required receipt operation');
-    if (context.requiredOperation === 'receipt_create' && context.baselinePlan) assertReceiptPlanFidelity(plan, context.baselinePlan, turn);
-    return plan;
+    const normalizedPlan = normalizeRelativeScopes
+      ? normalizeFinancePlanRelativeTemporalScopes(plan, turn)
+      : plan;
+    if (context.requiredOperation && normalizedPlan.operation !== context.requiredOperation) throw new ProtocolValidationError('invalid_receipt_plan', 'mock plan changed the required receipt operation');
+    if (context.requiredOperation === 'receipt_create' && context.baselinePlan) assertReceiptPlanFidelity(normalizedPlan, context.baselinePlan, turn);
+    return normalizedPlan;
   }
   if (!turn.text?.trim()) throw new ProtocolValidationError('interpretation_failed', 'natural-language turn has no text');
   const catalog = context.referenceCatalog || await loadFinanceReferenceCatalog(env);
@@ -895,8 +1000,11 @@ export async function interpretFinanceTurn(
           '支持 create/query/summarize/analyze/compare/update/delete/restore；有歧义时不要替用户选择不存在的目标，返回可被上层识别的低置信度计划。',
           '所有金额使用整数分、货币只能 CNY；时间使用 Asia/Shanghai 的 ISO date-time；账户和分类只能从当前目录中选择。',
           `当前消息的 Asia/Shanghai 本地日期=${referenceLocalDate}（event_time=${turn.event_time}；相对时间必须以此为准，不能使用 received_time）。`,
+          `代码已根据 event_time 计算相对时间事实：${JSON.stringify(relativeTemporalScopesForTurn(turn))}。你只负责选择用户表达对应的事实；from/to 必须原样复制对应事实，禁止自行计算日期。`,
           `若用户说“今天/今日”，必须把 temporal_scope 完整展开为 {"from":"${referenceLocalDate}T00:00:00+08:00","to":"${followingLocalDate}T00:00:00+08:00","timezone":"Asia/Shanghai","end_exclusive":true,"source_phrase":"今天"}；禁止输出 {"type":"today"}、{"date":"today"} 或其他未展开的相对日期结构。`,
           'query/summarize/analyze/compare 必须填写完整的时间范围字段（compare 要填写 left_scope 和 right_scope）；没有结果集引用时 reference 必须是 null。用户说“支出”时 filters.types 必须包含 expense；“明细/账单/记录”时 query 的 presentation.mode 使用 details。',
+          'operation 规则：只问某段时间的总额/收支/结余用 summarize；要求“哪一类/分类排行/占比/花得最多”等维度时用 analyze，metric=expense、dimension=category；同时要求总支出和最大分类时也必须用 analyze，它的 summary 提供总额。query 主要用于明细/账单/记录。',
+          'filters 规则：semantic_search=true 且 semantic_text 为短关键词，只能用于用户明确要求按描述、商家、分类或商品关键词搜索；普通“消费/支出/收入/花了多少/哪一类/上个月”等意图词、时间短语和整句绝不能写入 semantic_text。没有明确关键词时省略 semantic_search 和 semantic_text；没有 semantic_search 许可的 semantic_text 会被安全丢弃。',
           '只能输出协议字段：不要输出 action、query_type、date、currency、unit 等旧版或自定义字段；不要把空对象 {} 当作 reference。',
           `当前 session_version=${context.sessionVersion}，当前 turn_id=${turn.turn_id}。`,
           financeReferencePrompt(catalog),
@@ -914,10 +1022,12 @@ export async function interpretFinanceTurn(
   });
   const parsed = parseAiResponse(result) as Record<string, unknown> | null;
   let plan: FinancePlan;
+  let normalizeRelativeScopes = true;
   if (parsed && parsed.kind === 'new_plan') {
     plan = validateFinancePlan(parsed.plan, turn);
   } else if (parsed && parsed.kind === 'patch_plan') {
     if (!context.activePlan) throw new ProtocolValidationError('ordering_conflict', 'patch plan requires an active plan');
+    normalizeRelativeScopes = patchReplacesTemporalScope(parsed.patch);
     plan = applyFinancePlanPatch(context.activePlan, parsed.patch, turn);
   } else if (parsed && parsed.kind === 'clarification') {
     const clarification = objectValue(parsed.clarification, 'clarification_required');
@@ -927,9 +1037,12 @@ export async function interpretFinanceTurn(
   } else {
     plan = validateFinancePlan(parsed, turn);
   }
-  if (context.requiredOperation && plan.operation !== context.requiredOperation) {
+  const normalizedPlan = normalizeRelativeScopes
+    ? normalizeFinancePlanRelativeTemporalScopes(plan, turn)
+    : plan;
+  if (context.requiredOperation && normalizedPlan.operation !== context.requiredOperation) {
     throw new ProtocolValidationError('invalid_receipt_plan', 'orchestrator changed the required receipt operation');
   }
-  if (context.requiredOperation === 'receipt_create' && context.baselinePlan) assertReceiptPlanFidelity(plan, context.baselinePlan, turn);
-  return plan;
+  if (context.requiredOperation === 'receipt_create' && context.baselinePlan) assertReceiptPlanFidelity(normalizedPlan, context.baselinePlan, turn);
+  return normalizedPlan;
 }

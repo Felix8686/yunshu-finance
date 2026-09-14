@@ -1,8 +1,25 @@
-import { canonicalizeJson, sha256Hex, type FinancePresentation, type FinanceResult, type RenderPayload } from './protocol';
+import { canonicalizeJson, sha256Hex, type FinancePresentation, type FinanceResult, type FinanceSummary, type RenderPayload } from './protocol';
 import { assertRenderCapacity } from './capacity';
 
 function yuan(fen: number): string {
   return `¥${(fen / 100).toFixed(2)}`;
+}
+
+function analysisText(data: Record<string, unknown>, summary: FinanceSummary | null | undefined): string[] {
+  const dimensions = Array.isArray(data.dimensions) ? data.dimensions : [];
+  const isExpenseCategory = (data.metric === 'expense' || data.metric === 'category_share') && data.dimension === 'category';
+  if (!isExpenseCategory || !dimensions.length) return [`分析：${JSON.stringify(data)}`];
+  const totalExpense = summary?.expense_fen || 0;
+  const lines = ['支出分类：'];
+  dimensions.slice(0, 3).forEach((item, index) => {
+    if (!item || typeof item !== 'object') return;
+    const row = item as Record<string, unknown>;
+    const key = typeof row.key === 'string' && row.key ? row.key : '未分类';
+    const value = typeof row.value_fen === 'number' ? row.value_fen : Number(row.value_fen || 0);
+    const share = totalExpense > 0 ? `（占支出 ${((value / totalExpense) * 100).toFixed(2)}%）` : '';
+    lines.push(`${index + 1}. ${key} ${yuan(value)}${share}`);
+  });
+  return lines;
 }
 
 function resultText(result: FinanceResult, presentation: FinancePresentation): string {
@@ -38,7 +55,7 @@ function resultText(result: FinanceResult, presentation: FinancePresentation): s
     });
     if (result.page?.has_next || (presentation.page_size && result.rows.length >= presentation.page_size)) lines.push('可以继续说“下一页”。');
   }
-  if (result.operation === 'analyze' && result.analysis_data) lines.push(`分析：${JSON.stringify(result.analysis_data)}`);
+  if (result.operation === 'analyze' && result.analysis_data) lines.push(...analysisText(result.analysis_data, result.summary));
   if (result.operation === 'compare' && result.comparison_data) lines.push(`对比：${JSON.stringify(result.comparison_data)}`);
   return lines.join('\n') || '已完成。';
 }
