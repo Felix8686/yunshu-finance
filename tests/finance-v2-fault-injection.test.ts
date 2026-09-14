@@ -83,7 +83,7 @@ const statementDb = {
   }
 } as unknown as D1Like;
 assert.throws(() => buildResultSetStatements(statementDb, resultSet), /OPERATION_TOO_LARGE/);
-assert.equal(prepareCount, MAX_D1_BATCH_STATEMENTS + 1);
+assert.equal(prepareCount, 0, 'result-set capacity must reject oversized snapshots before preparing writes');
 
 const epochRaceDb = {
   prepare(sql: string) {

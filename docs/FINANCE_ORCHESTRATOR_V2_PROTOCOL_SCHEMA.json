@@ -313,6 +313,7 @@
         "categories": {"type": "array", "items": {"$ref": "#/$defs/CatalogReference"}, "maxItems": 16},
         "accounts": {"type": "array", "items": {"$ref": "#/$defs/CatalogReference"}, "maxItems": 16},
         "merchant_text": {"type": ["string", "null"], "maxLength": 128},
+        "semantic_search": {"type": "boolean"},
         "semantic_text": {"type": ["string", "null"], "maxLength": 256},
         "amount_min_fen": {"type": ["integer", "null"], "minimum": 0},
         "amount_max_fen": {"type": ["integer", "null"], "minimum": 0}

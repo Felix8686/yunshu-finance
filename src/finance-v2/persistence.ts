@@ -19,7 +19,7 @@ import {
   type TurnContextSnapshot
 } from './protocol';
 import { planRuntimeControlTransition, type RuntimeControlPatch } from './runtime-control';
-import { MAX_D1_BATCH_STATEMENTS, MAX_FINANCE_RESULT_JSON_BYTES, MAX_MUTATION_TARGETS, MAX_OPERATION_ATTEMPTS, assertRenderCapacity } from './capacity';
+import { MAX_D1_BATCH_STATEMENTS, MAX_FINANCE_RESULT_JSON_BYTES, MAX_MUTATION_TARGETS, MAX_OPERATION_ATTEMPTS, MAX_RESULT_SET_ROWS, assertRenderCapacity } from './capacity';
 import { renderFinanceResult } from './renderer';
 
 interface D1RunMeta {
@@ -565,6 +565,12 @@ export function buildResultSetStatements(
   planVersion = 1,
   routeEpoch?: number
 ): D1StatementLike[] {
+  if (snapshot.items.length > MAX_RESULT_SET_ROWS) throw new Error('OPERATION_TOO_LARGE');
+  // Keep the result-set write atomic with the operation fence, but do not
+  // spend one D1 batch statement per row.  The commit path adds a write
+  // assertion after every statement, so 200 item rows would otherwise exceed
+  // MAX_D1_BATCH_STATEMENTS before the result is committed.
+  const itemsPerStatement = 80;
   const statements: D1StatementLike[] = [
     db.prepare(
       `INSERT INTO finance_result_sets (
@@ -592,26 +598,35 @@ export function buildResultSetStatements(
       routeEpoch ?? null
     )
   ];
-  for (const item of snapshot.items) {
+  for (let offset = 0; offset < snapshot.items.length; offset += itemsPerStatement) {
+    const chunk = snapshot.items.slice(offset, offset + itemsPerStatement);
+    const rowSelects = chunk.map(() =>
+      `SELECT ?, ?, ?, ?, ?, ?, ? FROM eligible`
+    ).join(' UNION ALL ');
+    const params: unknown[] = [routeEpoch ?? null, routeEpoch ?? null];
+    for (const item of chunk) {
+      params.push(
+        snapshot.result_set_id,
+        item.ordinal,
+        item.entity_type,
+        item.entity_id,
+        item.entity_fingerprint,
+        item.row_snapshot_json,
+        item.row_snapshot_bytes
+      );
+    }
     statements.push(db.prepare(
-      `INSERT INTO finance_result_set_items (
+      `WITH eligible AS (
+         SELECT 1
+           FROM finance_runtime_control c
+          WHERE c.control_id = 'primary' AND (? IS NULL OR c.config_epoch = ?)
+       )
+       INSERT INTO finance_result_set_items (
          result_set_id, ordinal, entity_type, entity_id, entity_fingerprint,
          row_snapshot_json, row_snapshot_bytes
        )
-       SELECT ?, ?, ?, ?, ?, ?, ?
-         FROM finance_runtime_control c
-        WHERE c.control_id = 'primary' AND (? IS NULL OR c.config_epoch = ?)`
-    ).bind(
-      snapshot.result_set_id,
-      item.ordinal,
-      item.entity_type,
-      item.entity_id,
-      item.entity_fingerprint,
-      item.row_snapshot_json,
-      item.row_snapshot_bytes,
-      routeEpoch ?? null,
-      routeEpoch ?? null
-    ));
+       ${rowSelects}`
+    ).bind(...params));
   }
   if (statements.length > MAX_D1_BATCH_STATEMENTS) throw new Error('OPERATION_TOO_LARGE');
   return statements;
@@ -967,17 +982,19 @@ export async function commitFinanceOperation(db: D1Like, input: CommitFinanceOpe
   ];
   // Zero-row CAS updates are not SQL errors. Assert each write inside the
   // same transaction so a lost fence rolls back preceding ledger mutations.
+  // A result-set item statement may intentionally insert a batch of rows, so
+  // the assertion is "at least one" rather than "exactly one".
   if (writes.length * 2 > MAX_D1_BATCH_STATEMENTS) throw new Error('OPERATION_TOO_LARGE');
   const guarded = writes.flatMap((statement) => [
     statement,
-    db.prepare(`SELECT CASE WHEN changes() = 1 THEN 1 ELSE abs(-9223372036854775808) END AS write_assertion`)
+    db.prepare(`SELECT CASE WHEN changes() > 0 THEN 1 ELSE abs(-9223372036854775808) END AS write_assertion`)
   ]);
   const guardedResults = await db.batch(guarded);
   const batchResults = guardedResults.filter((_, index) => index % 2 === 0);
   const sideEffectChanges = batchResults
     .slice(0, input.side_effect_statements.length)
     .map(changes);
-  if (sideEffectChanges.some((count) => count !== 1)) {
+  if (sideEffectChanges.some((count) => count <= 0)) {
     throw new Error('STALE_FENCE_OR_SESSION_CAS');
   }
   const resultIndex = input.side_effect_statements.length;
