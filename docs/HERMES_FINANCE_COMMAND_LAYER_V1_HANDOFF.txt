@@ -1,0 +1,113 @@
+Finance Command Layer v1 - Hermes Handoff
+
+Status:
+- ChatGPT implemented the first code pass on branch feat/finance-command-layer-v1.
+- main has not been modified by this branch.
+- This branch is NOT approved for production deployment yet.
+
+Purpose:
+Replace the growing set of sentence-specific finance intents with a generic model-driven command layer.
+
+Implemented command actions:
+- create
+- query
+- summarize
+- update
+- delete
+- restore
+- passthrough
+
+Key design:
+- LLM maps natural language to a fixed FinanceCommand schema.
+- Program code resolves actual ledger targets and executes validated operations.
+- LLM never invents transaction IDs and never directly accesses D1.
+- create supports transactions[] so Telegram creation does not require a second LLM parse.
+- update/delete refuse ambiguous matched targets when count is not explicit.
+- delete is reversible: the active transaction is removed, but a complete transaction + transaction_items snapshot is persisted in ledger_operations.
+- restore recreates the deleted transaction and its transaction_items from the audit snapshot.
+- update/delete/restore operations are recorded in ledger_operations.
+- D1 batch is used for multi-step mutations.
+
+New migration:
+- migrations/0007_ledger_operations.sql
+
+Main new code:
+- src/finance-command.ts
+- src/app.ts routes Telegram text through the command layer before legacy finance conversation/query handlers.
+- /health version raised to 0.7.0 with finance_command_layer=true.
+
+Important review/test areas for Hermes:
+1. Run npm ci, npm run typecheck, npm test, wrangler deploy --dry-run.
+2. Apply migrations 0001-0007 to isolated local D1 only.
+3. Do not modify production D1 and do not deploy production Worker.
+4. Verify current existing create behavior still works:
+   - 单笔：午饭25元
+   - 多笔：一盒硬白沙烟10元，一提维达抽纸18.9
+   - source_id suffix behavior must remain tg_x / tg_x#2.
+5. Verify generic update language:
+   - 刚才那笔改成支付宝
+   - 刚才那笔金额不是38，是28
+   - 昨天那笔打车改成交通
+6. Verify generic delete language:
+   - 撤销上一笔
+   - 把刚才两笔删掉
+   - 删除昨天买烟的那笔
+7. Verify restore:
+   - 恢复刚才删掉的那笔
+   - deletion of a receipt transaction with transaction_items, then restore, must restore both parent transaction and items.
+8. Verify ambiguity safety:
+   - when a matched update/delete can refer to multiple records and user did not specify count, no mutation may occur; Bot must ask for narrower details.
+9. Verify query/summarize:
+   - 刚才那笔是什么
+   - 找一下昨天买烟的记录
+   - 刚才两笔一共多少
+10. Verify passthrough compatibility:
+   - 本月花了多少 / 本月支出明细 / 哪些部分花得多 / 跟上个月比
+   Existing finance query/conversation behavior must not regress.
+11. Verify one Telegram create message results in only one Workers AI parse call through the new command layer, not command parse + legacy intake parse.
+12. Verify idempotency for duplicate Telegram delivery on create.
+13. Verify D1 batch rollback by forcing one statement in create/update/delete/restore to fail. No partial active-ledger mutation or partial audit log should remain.
+14. Verify ledger_operations snapshots do not lose source/source_id/raw_text/category_id/account_id/occurred_at/created_at/updated_at and receipt transaction_items.
+15. Inspect whether summarize/query target limits can truncate valid large result sets. If yes, report as FAIL; do not silently accept approximate totals.
+16. Inspect whether create reply formatting exactly preserves acceptable existing Telegram UX.
+17. Check AI schema compatibility with the configured Cloudflare Workers AI model using a real isolated Workers AI call.
+
+Required real-model language matrix (isolated, no production writes):
+- 午饭25元
+- 一盒硬白沙烟10元，一提维达抽纸18.9
+- 撤销上一笔
+- 把刚才两笔删掉
+- 刚才那笔改成支付宝
+- 刚才金额不是38，是28
+- 找一下昨天买烟的记录
+- 刚才两笔一共多少
+- 恢复刚才删掉的那笔
+- 哪些部分花得多可以优化
+
+Expected routing:
+- create / create / delete / delete / update / update / query / summarize / restore / passthrough
+
+Do not fix failures directly on main.
+If code changes are necessary, modify only feat/finance-command-layer-v1 and report exact evidence and resulting HEAD to the user for ChatGPT review.
+
+Final report format:
+1. Overall PASS/FAIL
+2. branch HEAD
+3. main HEAD and whether unchanged
+4. typecheck
+5. npm test
+6. dry-run
+7. local 0007 migration
+8. real Workers AI command-routing matrix
+9. create single/multi results
+10. update results
+11. delete results
+12. restore results including receipt items
+13. ambiguity guard result
+14. duplicate create idempotency
+15. atomic rollback tests
+16. passthrough regression checks
+17. query/summarize exactness including large-set truncation check
+18. production modified: must be NO
+19. production deployed: must be NO
+20. blockers/recommended code changes

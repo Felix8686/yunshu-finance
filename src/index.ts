@@ -1,315 +1,646 @@
-import { createTransactions, isUpdateProcessed, runReport, undoLatestTransactionGroup, type ReportResult, type SummaryResult } from "./db";
-import { interpretFinanceCommand, interpretFinanceCommandFromImage } from "./deepseek";
-import { MediaDownloadError, MediaTooLargeError, arrayBufferToBase64, fetchTelegramMedia, transcribeVoice } from "./media";
-import type { Env, FinanceCommand } from "./types";
+import { parseIntake } from './ai';
+import { resolveAccountId, resolveCategoryId } from './finance-reference';
+import { generateObjectKey, normalizeRelativePath, computeSha256, getSyncFileRecord, listSyncFiles } from './sync';
+import { resolveTelegramReferenceTime } from './telegram-time';
+import type { Env, TelegramUpdate } from './types';
 
-interface TelegramPhotoSize {
-  file_id: string;
-  file_size?: number;
-  width: number;
-  height: number;
-}
-
-interface TelegramDocument {
-  file_id: string;
-  mime_type?: string;
-  file_size?: number;
-}
-
-interface TelegramVoice {
-  file_id: string;
-  mime_type?: string;
-  file_size?: number;
-  duration?: number;
-}
-
-interface TelegramUpdate {
-  message?: {
-    message_id: number;
-    text?: string;
-    caption?: string;
-    photo?: TelegramPhotoSize[];
-    document?: TelegramDocument;
-    voice?: TelegramVoice;
-    chat: { id: number };
-    from?: { id: number };
-  };
-}
-
-const SUPPORTED_IMAGE_MIME = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
-const VISION_FALLBACK_MODEL = "deepseek-v4-flash-vision-exp";
-
-function pickLargestPhoto(photo: TelegramPhotoSize[]): TelegramPhotoSize {
-  return photo.reduce((largest, item) => ((item.file_size ?? 0) > (largest.file_size ?? 0) ? item : largest));
-}
-
-function yuan(fen: number): string {
-  return `¥${(fen / 100).toFixed(2)}`;
-}
-
-function summaryLines(label: string, summary: SummaryResult): string[] {
-  const balance = summary.income_fen - summary.expense_fen;
-  return [
-    label,
-    `收入：${yuan(summary.income_fen)}`,
-    `支出：${yuan(summary.expense_fen)}`,
-    `结余：${balance < 0 ? "-" : "+"}${yuan(Math.abs(balance))}`,
-    `记录：${summary.count} 笔`,
-  ];
-}
-
-function deltaText(name: string, current: number, previous: number): string {
-  const delta = current - previous;
-  if (delta === 0) return `${name}：持平`;
-  const direction = delta > 0 ? "增加" : "减少";
-  const absolute = yuan(Math.abs(delta));
-  if (previous === 0) return `${name}：${direction} ${absolute}`;
-  const percent = (Math.abs(delta) / previous) * 100;
-  return `${name}：${direction} ${absolute}（${percent.toFixed(1)}%）`;
-}
-
-function renderReport(result: ReportResult): string {
-  if (result.kind === "summary") {
-    return summaryLines(result.range.label, result.summary).join("\n");
-  }
-
-  if (result.kind === "details") {
-    const lines = summaryLines(result.range.label, result.summary);
-    if (result.rows.length === 0) return `${lines.join("\n")}\n\n没有找到明细。`;
-    lines.push("", "明细：");
-    for (const row of result.rows) {
-      const sign = row.type === "expense" ? "-" : "+";
-      const description = row.description ? ` ${row.description}` : "";
-      lines.push(`${row.occurred_at.slice(0, 10)} ${sign}${yuan(row.amount_fen)} ${row.category}${description} · ${row.account}`);
+function jsonResponse(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Telegram-Bot-Api-Secret-Token, X-Wanxiang-Path, X-Wanxiang-Base-Version, X-Wanxiang-Base-Hash, X-Wanxiang-Modified-At, X-Wanxiang-Source',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS'
     }
-    return lines.join("\n");
-  }
-
-  if (result.kind === "category_breakdown") {
-    const lines = summaryLines(result.range.label, result.summary);
-    if (result.rows.length === 0) return `${lines.join("\n")}\n\n没有找到分类数据。`;
-    lines.push("", "分类：");
-    for (const row of result.rows) {
-      const name = row.type === "expense" ? "支出" : "收入";
-      lines.push(`${name} · ${row.category}：${yuan(row.amount_fen)}（${row.count} 笔）`);
-    }
-    return lines.join("\n");
-  }
-
-  const lines = [
-    ...summaryLines(result.range.label, result.current),
-    "",
-    ...summaryLines(result.compare_range.label, result.previous),
-    "",
-    "变化：",
-    deltaText("收入", result.current.income_fen, result.previous.income_fen),
-    deltaText("支出", result.current.expense_fen, result.previous.expense_fen),
-  ];
-  return lines.join("\n");
-}
-
-async function sendTelegram(env: Env, chatId: string, text: string, replyToMessageId?: string): Promise<void> {
-  const body: Record<string, unknown> = {
-    chat_id: chatId,
-    text: text.slice(0, 4000),
-  };
-  if (replyToMessageId) {
-    body.reply_to_message_id = Number(replyToMessageId);
-    body.allow_sending_without_reply = true;
-  }
-
-  const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
   });
-
-  if (!response.ok) {
-    throw new Error(`Telegram sendMessage failed with HTTP ${response.status}`);
-  }
 }
 
-function renderCreate(command: Extract<FinanceCommand, { action: "create" }>): string {
-  const lines = [`已记录 ${command.transactions.length} 笔：`];
-  for (const item of command.transactions) {
-    const sign = item.type === "expense" ? "-" : "+";
-    const description = item.description ? ` ${item.description}` : "";
-    lines.push(`${sign}${yuan(item.amount_fen)} ${item.category}${description} · ${item.account}`);
-  }
-  return lines.join("\n");
+function verifyBearerToken(request: Request, env: Env, includeSyncToken = false): boolean {
+  const authHeader = request.headers.get('Authorization') || '';
+  const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+  const requestPath = new URL(request.url).pathname;
+  const syncTokenAllowed = includeSyncToken && requestPath.startsWith('/v1/sync/');
+  const configuredTokens = syncTokenAllowed
+    ? [env.OBSIDIAN_SYNC_API_KEY, env.WANXIANG_API_KEY, env.API_BEARER_TOKEN]
+    : [env.WANXIANG_API_KEY, env.API_BEARER_TOKEN];
+  return configuredTokens.filter((value): value is string => Boolean(value)).includes(token);
 }
 
-async function interpretPhoto(
-  env: Env,
-  timeZone: string,
-  fileId: string,
-  mimeType: string,
-  caption: string,
-): Promise<FinanceCommand> {
-  const media = await fetchTelegramMedia(env, fileId);
-  const imageBase64 = arrayBufferToBase64(media);
-  const visionModel = env.DEEPSEEK_VISION_MODEL || VISION_FALLBACK_MODEL;
-  return interpretFinanceCommandFromImage(env.DEEPSEEK_API_KEY, visionModel, timeZone, imageBase64, mimeType, caption);
+function getBearerOrSecret(env: Env): string | undefined {
+  return env.WANXIANG_API_KEY || env.API_BEARER_TOKEN;
 }
 
-async function handleUpdate(env: Env, update: TelegramUpdate): Promise<void> {
-  const message = update.message;
-  if (!message?.from) return;
+function getLocalNow(timeZone: string): string {
+  return resolveTelegramReferenceTime(undefined, timeZone);
+}
 
-  const chatId = String(message.chat.id);
-  const messageId = String(message.message_id);
-
-  if (String(message.from.id) !== env.OWNER_TELEGRAM_ID) {
-    await sendTelegram(env, chatId, "该机器人仅供所有者使用。", messageId);
-    return;
-  }
-
-  // Deterministic replay guard: a redelivered update must never reach the
-  // interpreter again, so state-changing actions execute exactly once.
-  if (await isUpdateProcessed(env.DB, chatId, messageId)) {
-    await sendTelegram(env, chatId, "这条消息已经处理过，没有重复执行。", messageId);
-    return;
-  }
-
-  const timeZone = env.APP_TIMEZONE || "Asia/Shanghai";
-  const model = env.DEEPSEEK_MODEL || "deepseek-chat";
-
-  let command: FinanceCommand;
-  let rawText: string;
-  try {
-    if (message.text) {
-      command = await interpretFinanceCommand(env.DEEPSEEK_API_KEY, model, timeZone, message.text);
-      rawText = message.text;
-    } else if (Array.isArray(message.photo) && message.photo.length > 0) {
-      const photo = pickLargestPhoto(message.photo);
-      command = await interpretPhoto(env, timeZone, photo.file_id, "image/jpeg", message.caption ?? "");
-      rawText = `[image] ${message.caption ?? ""}`.trim();
-    } else if (message.document && SUPPORTED_IMAGE_MIME.has(message.document.mime_type ?? "")) {
-      command = await interpretPhoto(env, timeZone, message.document.file_id, message.document.mime_type as string, message.caption ?? "");
-      rawText = `[image] ${message.caption ?? ""}`.trim();
-    } else if (message.voice) {
-      const transcript = await transcribeVoice(env, message.voice.file_id);
-      if (!transcript) {
-        await sendTelegram(env, chatId, "语音识别失败，请重新发送。", messageId);
-        return;
-      }
-      command = await interpretFinanceCommand(env.DEEPSEEK_API_KEY, model, timeZone, transcript);
-      rawText = `[voice] ${transcript}`;
-    } else if (message.document) {
-      await sendTelegram(env, chatId, "目前只支持图片和语音消息。", messageId);
-      return;
-    } else {
-      return;
-    }
-  } catch (error) {
-    if (error instanceof MediaTooLargeError) {
-      await sendTelegram(env, chatId, "文件过大，目前无法处理。", messageId);
-      return;
-    }
-    if (error instanceof MediaDownloadError) {
-      await sendTelegram(env, chatId, "文件下载失败，请重新发送。", messageId);
-      return;
-    }
-    const isImage = Array.isArray(message.photo) || (!!message.document && SUPPORTED_IMAGE_MIME.has(message.document.mime_type ?? ""));
-    if (!message.text && isImage) {
-      await sendTelegram(env, chatId, "图片无法读取，请重新发送。", messageId);
-      return;
-    }
-    if (!message.text && message.voice) {
-      await sendTelegram(env, chatId, "语音识别失败，请重新发送。", messageId);
-      return;
-    }
-    throw error;
-  }
-
-  const mediaId = Array.isArray(message.photo) && message.photo.length > 0
-    ? `photo=${pickLargestPhoto(message.photo).file_id}`
-    : (message.document && SUPPORTED_IMAGE_MIME.has(message.document.mime_type ?? "")
-      ? `doc=${message.document.file_id}`
-      : (message.voice ? `voice=${message.voice.file_id}` : ""));
-  console.log(`yunshu command chat=${chatId} msg=${messageId} ${mediaId ? `${mediaId} ` : ""}text=${JSON.stringify(rawText.slice(0, 200))} command=${JSON.stringify(command)}`);
-
-  if (command.action === "create") {
-    const result = await createTransactions(env.DB, command.transactions, {
-      chatId,
-      messageId,
-      rawText,
-    });
-    const reply = result.duplicate
-      ? "这条消息已经处理过，没有重复入账。"
-      : renderCreate(command);
-    await sendTelegram(env, chatId, reply, messageId);
-    return;
-  }
-
-  if (command.action === "report") {
-    const report = await runReport(env.DB, command);
-    await sendTelegram(env, chatId, renderReport(report), messageId);
-    return;
-  }
-
-  if (command.action === "undo") {
-    const result = await undoLatestTransactionGroup(env.DB, chatId, messageId);
-    const reply = result.duplicate
-      ? "这条撤销已经执行过，没有重复删除。"
-      : result.found
-        ? `已撤销最近一次记账，共 ${result.count} 笔。`
-        : "没有可撤销的记账记录。";
-    await sendTelegram(env, chatId, reply, messageId);
-    return;
-  }
-
-  if (command.action === "clarify") {
-    await sendTelegram(env, chatId, command.question, messageId);
-    return;
-  }
-
-  await sendTelegram(env, chatId, command.message, messageId);
+function fallbackCategoryName(type: 'expense' | 'income' | 'transfer'): string {
+  if (type === 'income') return '其他收入';
+  if (type === 'transfer') return '转账';
+  return '其他支出';
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    const method = request.method.toUpperCase();
 
-    if (request.method === "GET" && url.pathname === "/health") {
-      return Response.json({
-        ok: true,
-        service: "yunshu-finance",
-        version: "0.2.0",
+    if (method === 'OPTIONS') {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Telegram-Bot-Api-Secret-Token, X-Wanxiang-Path, X-Wanxiang-Base-Version, X-Wanxiang-Base-Hash, X-Wanxiang-Modified-At, X-Wanxiang-Source',
+          'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS'
+        }
       });
     }
 
-    if (request.method !== "POST" || url.pathname !== "/telegram/webhook") {
-      return new Response("Not Found", { status: 404 });
+    // Health check
+    if (url.pathname === '/health' && method === 'GET') {
+      return jsonResponse({
+        ok: true,
+        service: 'wanxiang-cloud',
+        version: '0.2.0',
+        r2_bound: !!env.FILES,
+        d1_bound: !!env.DB
+      });
     }
 
-    const secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
-    if (!env.TELEGRAM_SECRET_TOKEN || secret !== env.TELEGRAM_SECRET_TOKEN) {
-      console.log(`yunshu auth failed expected_len=${env.TELEGRAM_SECRET_TOKEN?.length ?? -1} got_len=${secret?.length ?? -1}`);
-      return new Response("Unauthorized", { status: 401 });
+    // ==========================================
+    // v0.2: R2 & Obsidian Sync API endpoints
+    // ==========================================
+
+    // 1. GET /v1/sync/list
+    if (url.pathname === '/v1/sync/list' && method === 'GET') {
+      if (!verifyBearerToken(request, env, true)) {
+        return jsonResponse({ ok: false, error: 'UNAUTHORIZED' }, 401);
+      }
+      const includeDeleted = url.searchParams.get('include_deleted') === 'true';
+      const files = await listSyncFiles(env.DB, includeDeleted);
+      return jsonResponse({ ok: true, data: { files } });
     }
 
-    let update: TelegramUpdate;
-    try {
-      update = (await request.json()) as TelegramUpdate;
-    } catch {
-      return new Response("Bad Request", { status: 400 });
+    // 2. GET /v1/sync/metadata
+    if (url.pathname === '/v1/sync/metadata' && method === 'GET') {
+      if (!verifyBearerToken(request, env, true)) {
+        return jsonResponse({ ok: false, error: 'UNAUTHORIZED' }, 401);
+      }
+      const pathParam = url.searchParams.get('path');
+      if (!pathParam) {
+        return jsonResponse({ ok: false, error: 'PATH_REQUIRED' }, 400);
+      }
+      let normPath: string;
+      try {
+        normPath = normalizeRelativePath(pathParam);
+      } catch {
+        return jsonResponse({ ok: false, error: 'INVALID_PATH' }, 400);
+      }
+      const record = await getSyncFileRecord(env.DB, normPath);
+      if (!record) {
+        return jsonResponse({ ok: false, error: 'FILE_NOT_FOUND' }, 404);
+      }
+      return jsonResponse({ ok: true, data: { file: record } });
     }
 
-    try {
-      await handleUpdate(env, update);
-    } catch (error) {
-      console.error("yunshu request failed", error);
-      const message = update.message;
-      if (message?.chat?.id && message.message_id) {
-        try {
-          await sendTelegram(env, String(message.chat.id), "处理失败，请稍后重试。", String(message.message_id));
-        } catch (sendError) {
-          console.error("yunshu error reply failed", sendError);
+    // 3. GET /v1/sync/file
+    if (url.pathname === '/v1/sync/file' && method === 'GET') {
+      if (!verifyBearerToken(request, env, true)) {
+        return jsonResponse({ ok: false, error: 'UNAUTHORIZED' }, 401);
+      }
+      const pathParam = url.searchParams.get('path');
+      if (!pathParam) {
+        return jsonResponse({ ok: false, error: 'PATH_REQUIRED' }, 400);
+      }
+      let normPath: string;
+      try {
+        normPath = normalizeRelativePath(pathParam);
+      } catch {
+        return jsonResponse({ ok: false, error: 'INVALID_PATH' }, 400);
+      }
+      const record = await getSyncFileRecord(env.DB, normPath);
+      if (!record || record.is_deleted === 1) {
+        return jsonResponse({ ok: false, error: 'FILE_NOT_FOUND_OR_DELETED' }, 404);
+      }
+      const object = await env.FILES.get(record.object_key);
+      if (!object) {
+        return jsonResponse({ ok: false, error: 'R2_OBJECT_NOT_FOUND' }, 404);
+      }
+
+      const headers = new Headers();
+      headers.set('Content-Type', record.path.endsWith('.md') ? 'text/markdown; charset=utf-8' : 'application/octet-stream');
+      headers.set('X-Wanxiang-Path', record.path);
+      headers.set('X-Wanxiang-Version', record.version.toString());
+      headers.set('X-Wanxiang-Content-Hash', record.content_hash);
+      headers.set('X-Wanxiang-Modified-At', record.modified_at);
+
+      return new Response(object.body as unknown as BodyInit, {
+        status: 200,
+        headers
+      });
+    }
+
+    // 4. PUT /v1/sync/file (Upload / Update)
+    if (url.pathname === '/v1/sync/file' && (method === 'PUT' || method === 'POST')) {
+      if (!verifyBearerToken(request, env, true)) {
+        return jsonResponse({ ok: false, error: 'UNAUTHORIZED' }, 401);
+      }
+
+      const pathHeader = request.headers.get('X-Wanxiang-Path') || url.searchParams.get('path');
+      const baseVersionHeader = request.headers.get('X-Wanxiang-Base-Version');
+      const baseHashHeader = request.headers.get('X-Wanxiang-Base-Hash');
+      const modifiedAtHeader = request.headers.get('X-Wanxiang-Modified-At') || new Date().toISOString();
+      const sourceHeader = request.headers.get('X-Wanxiang-Source') || 'local';
+
+      if (!pathHeader) {
+        return jsonResponse({ ok: false, error: 'PATH_REQUIRED' }, 400);
+      }
+
+      let normPath: string;
+      try {
+        normPath = normalizeRelativePath(pathHeader);
+      } catch {
+        return jsonResponse({ ok: false, error: 'INVALID_PATH' }, 400);
+      }
+
+      const fileBuffer = await request.arrayBuffer();
+      const contentHash = await computeSha256(fileBuffer);
+      const sizeBytes = fileBuffer.byteLength;
+      const objectKey = generateObjectKey(normPath);
+
+      // Check existing D1 record for conflict
+      const existing = await getSyncFileRecord(env.DB, normPath);
+
+      if (existing && existing.is_deleted === 0) {
+        // If content is identical, no-op success
+        if (existing.content_hash === contentHash) {
+          return jsonResponse({
+            ok: true,
+            message: 'FILE_UNCHANGED',
+            data: { file: existing }
+          });
         }
+
+        // Conflict check: if caller provided a base_version or base_hash, verify it matches current cloud version
+        if (baseVersionHeader && parseInt(baseVersionHeader, 10) !== existing.version) {
+          return jsonResponse({
+            ok: false,
+            error: 'CONFLICT',
+            message: `Cloud version (${existing.version}) is ahead of base version (${baseVersionHeader})`,
+            data: {
+              current_cloud: existing,
+              client_base_version: parseInt(baseVersionHeader, 10)
+            }
+          }, 409);
+        }
+
+        if (baseHashHeader && baseHashHeader !== existing.content_hash) {
+          return jsonResponse({
+            ok: false,
+            error: 'CONFLICT',
+            message: `Cloud content hash (${existing.content_hash}) differs from client base hash (${baseHashHeader})`,
+            data: {
+              current_cloud: existing,
+              client_base_hash: baseHashHeader
+            }
+          }, 409);
+        }
+      }
+
+      // Store in R2
+      await env.FILES.put(objectKey, fileBuffer, {
+        customMetadata: {
+          path: normPath,
+          content_hash: contentHash,
+          modified_at: modifiedAtHeader,
+          source: sourceHeader
+        }
+      });
+
+      const nextVersion = existing ? existing.version + 1 : 1;
+      const fileId = existing ? existing.id : crypto.randomUUID();
+      const nowIso = new Date().toISOString();
+
+      // Upsert into D1
+      await env.DB.prepare(`
+        INSERT INTO sync_files (
+          id, path, object_key, content_hash, version, size_bytes, modified_at, last_source, is_deleted, deleted_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)
+        ON CONFLICT(path) DO UPDATE SET
+          object_key = excluded.object_key,
+          content_hash = excluded.content_hash,
+          version = excluded.version,
+          size_bytes = excluded.size_bytes,
+          modified_at = excluded.modified_at,
+          last_source = excluded.last_source,
+          is_deleted = 0,
+          deleted_at = NULL,
+          updated_at = excluded.updated_at
+      `).bind(
+        fileId,
+        normPath,
+        objectKey,
+        contentHash,
+        nextVersion,
+        sizeBytes,
+        modifiedAtHeader,
+        sourceHeader,
+        nowIso,
+        nowIso
+      ).run();
+
+      const updatedRecord = await getSyncFileRecord(env.DB, normPath);
+
+      return jsonResponse({
+        ok: true,
+        message: 'FILE_SAVED',
+        data: { file: updatedRecord }
+      });
+    }
+
+    // 5. DELETE /v1/sync/file (Soft Delete / Tombstone)
+    if (url.pathname === '/v1/sync/file' && method === 'DELETE') {
+      if (!verifyBearerToken(request, env, true)) {
+        return jsonResponse({ ok: false, error: 'UNAUTHORIZED' }, 401);
+      }
+
+      const pathParam = url.searchParams.get('path');
+      if (!pathParam) {
+        return jsonResponse({ ok: false, error: 'PATH_REQUIRED' }, 400);
+      }
+
+      let normPath: string;
+      try {
+        normPath = normalizeRelativePath(pathParam);
+      } catch {
+        return jsonResponse({ ok: false, error: 'INVALID_PATH' }, 400);
+      }
+
+      const existing = await getSyncFileRecord(env.DB, normPath);
+      if (!existing || existing.is_deleted === 1) {
+        return jsonResponse({ ok: true, message: 'ALREADY_DELETED_OR_NOT_FOUND' });
+      }
+
+      const nowIso = new Date().toISOString();
+      const nextVersion = existing.version + 1;
+
+      // Soft delete: update D1 record to is_deleted=1 with deleted_at timestamp (do NOT delete R2 object)
+      await env.DB.prepare(`
+        UPDATE sync_files
+        SET is_deleted = 1, deleted_at = ?, version = ?, updated_at = ?
+        WHERE path = ?
+      `).bind(nowIso, nextVersion, nowIso, normPath).run();
+
+      const updated = await getSyncFileRecord(env.DB, normPath);
+
+      return jsonResponse({
+        ok: true,
+        message: 'FILE_SOFT_DELETED',
+        data: { file: updated }
+      });
+    }
+
+    // 6. POST /v1/sync/restore (Restore Soft-Deleted File)
+    if (url.pathname === '/v1/sync/restore' && method === 'POST') {
+      if (!verifyBearerToken(request, env, true)) {
+        return jsonResponse({ ok: false, error: 'UNAUTHORIZED' }, 401);
+      }
+
+      let body: { path?: string } = {};
+      try {
+        body = await request.json();
+      } catch {}
+
+      const pathParam = body.path || url.searchParams.get('path');
+      if (!pathParam) {
+        return jsonResponse({ ok: false, error: 'PATH_REQUIRED' }, 400);
+      }
+
+      let normPath: string;
+      try {
+        normPath = normalizeRelativePath(pathParam);
+      } catch {
+        return jsonResponse({ ok: false, error: 'INVALID_PATH' }, 400);
+      }
+
+      const existing = await getSyncFileRecord(env.DB, normPath);
+      if (!existing) {
+        return jsonResponse({ ok: false, error: 'FILE_NOT_FOUND' }, 404);
+      }
+      if (existing.is_deleted === 0) {
+        return jsonResponse({ ok: true, message: 'FILE_ALREADY_ACTIVE', data: { file: existing } });
+      }
+
+      // Verify R2 object still exists
+      const r2Obj = await env.FILES.head(existing.object_key);
+      if (!r2Obj) {
+        return jsonResponse({ ok: false, error: 'R2_OBJECT_MISSING_CANNOT_RESTORE' }, 500);
+      }
+
+      const nowIso = new Date().toISOString();
+      const nextVersion = existing.version + 1;
+
+      await env.DB.prepare(`
+        UPDATE sync_files
+        SET is_deleted = 0, deleted_at = NULL, version = ?, updated_at = ?
+        WHERE path = ?
+      `).bind(nextVersion, nowIso, normPath).run();
+
+      const updated = await getSyncFileRecord(env.DB, normPath);
+
+      return jsonResponse({
+        ok: true,
+        message: 'FILE_RESTORED',
+        data: { file: updated }
+      });
+    }
+
+    // ==========================================
+    // v0.1: Intakes & Telegram Webhook (Core)
+    // ==========================================
+
+    // POST /v1/intake
+    if (url.pathname === '/v1/intake' && method === 'POST') {
+      if (!verifyBearerToken(request, env)) {
+        return jsonResponse({ ok: false, error: 'UNAUTHORIZED' }, 401);
+      }
+
+      try {
+        const body = (await request.json()) as {
+          text?: string;
+          source?: string;
+          source_id?: string;
+          reference_time?: string;
+        };
+
+        if (!body.text || typeof body.text !== 'string') {
+          return jsonResponse({ ok: false, error: 'TEXT_REQUIRED' }, 400);
+        }
+
+        const source = body.source || 'manual_api';
+        const sourceId = body.source_id || crypto.randomUUID();
+
+        // 1. Idempotency Check
+        const existingTx = await env.DB.prepare(
+          'SELECT id FROM transactions WHERE source = ? AND source_id = ?'
+        )
+          .bind(source, sourceId)
+          .first<{ id: string }>();
+
+        if (existingTx) {
+          return jsonResponse({
+            ok: true,
+            message: '这条消息已经处理过，没有重复记账。',
+            data: { duplicate: true, transaction_id: existingTx.id }
+          });
+        }
+
+        // 2. AI Parsing. For Telegram, reference_time is the message's own server timestamp,
+        // not the later Worker processing time after a reconnect or queue delay.
+        const referenceLocalNow = body.reference_time || getLocalNow(env.APP_TIMEZONE || 'Asia/Shanghai');
+        const parsed = (env as unknown as { __mockParsedIntake?: import('./types').ParsedIntake }).__mockParsedIntake
+          || await parseIntake(env, body.text, referenceLocalNow);
+
+        // 3. Log Ingestion
+        const logId = crypto.randomUUID();
+        const logStatus = parsed.intent === 'unknown' ? 'failed' : 'parsed';
+        await env.DB.prepare(`
+          INSERT INTO ingestion_log (
+            id, source, source_id, raw_text, intent, status, error_message, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+          ON CONFLICT(source, source_id) DO UPDATE SET
+            intent = excluded.intent,
+            raw_text = excluded.raw_text,
+            status = excluded.status,
+            error_message = excluded.error_message
+        `)
+          .bind(
+            logId,
+            source,
+            sourceId,
+            body.text,
+            parsed.intent,
+            logStatus,
+            parsed.intent === 'unknown' ? 'unrecognized intake text' : null
+          )
+          .run();
+
+        // 4. Intent Execution
+        if (parsed.intent === 'unknown' || parsed.confidence < 0.5) {
+          return jsonResponse({
+            ok: false,
+            error: 'UNRECOGNIZED_INTAKE',
+            message: '未能准确理解您的记账内容，请尝试更清晰的描述（例如：晚饭25元）。'
+          }, 422);
+        }
+
+        if (parsed.intent === 'spending_today') {
+          const referenceDate = referenceLocalNow.slice(0, 10);
+          const queryRes = await env.DB.prepare(`
+            SELECT SUM(amount_fen) as total_fen FROM transactions
+            WHERE type = 'expense' AND substr(occurred_at, 1, 10) = ?
+          `).bind(referenceDate).first<{ total_fen: number | null }>();
+
+          const totalFen = queryRes?.total_fen || 0;
+          const totalYuan = (totalFen / 100).toFixed(2);
+
+          return jsonResponse({
+            ok: true,
+            message: `今天已记录支出 ¥${totalYuan}。`,
+            data: { total: totalFen / 100 }
+          });
+        }
+
+        if (parsed.intent === 'create_transaction') {
+          const txItems = parsed.transactions || [];
+          if (txItems.length === 0) {
+            return jsonResponse({
+              ok: false,
+              error: 'UNRECOGNIZED_INTAKE',
+              message: '未能准确理解您的记账内容，请尝试更清晰的描述。'
+            }, 422);
+          }
+
+          // Resolve accounts and categories for all transactions before writing
+          const preparedTxs = [];
+          for (let i = 0; i < txItems.length; i++) {
+            const item = txItems[i];
+            const accountId = await resolveAccountId(env, item.account_name)
+              || await resolveAccountId(env, '未指定');
+            if (!accountId) throw new Error('ACCOUNT_NOT_CONFIGURED');
+
+            const categoryId = await resolveCategoryId(env, item.category_name, item.transaction_type)
+              || await resolveCategoryId(env, fallbackCategoryName(item.transaction_type), item.transaction_type);
+            if (!categoryId) throw new Error('CATEGORY_NOT_CONFIGURED');
+
+            const amountFen = Math.round(item.amount * 100);
+            const txId = crypto.randomUUID();
+            // Source ID idempotent suffix rule: first gets sourceId, subsequent gets `${sourceId}#${i + 1}`
+            const itemSourceId = sourceId ? (i === 0 ? sourceId : `${sourceId}#${i + 1}`) : null;
+
+            preparedTxs.push({
+              id: txId,
+              item,
+              accountId,
+              categoryId,
+              amountFen,
+              sourceId: itemSourceId
+            });
+          }
+
+          // Atomically insert all transactions in batch
+          const statements = preparedTxs.map((ptx) => {
+            return env.DB.prepare(`
+              INSERT INTO transactions (
+                id, type, amount_fen, currency, account_id, category_id,
+                merchant, description, raw_text, source, source_id, occurred_at, created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            `).bind(
+              ptx.id,
+              ptx.item.transaction_type,
+              ptx.amountFen,
+              ptx.item.currency,
+              ptx.accountId,
+              ptx.categoryId,
+              ptx.item.merchant || null,
+              ptx.item.description || ptx.item.category_name,
+              body.text,
+              source,
+              ptx.sourceId,
+              ptx.item.occurred_at
+            );
+          });
+
+          await env.DB.batch(statements);
+
+          const totalAmount = txItems.reduce((sum: number, it: import('./types').ParsedTransactionItem) => sum + it.amount, 0);
+          const firstTx = preparedTxs[0];
+
+          let replyMsg = '';
+          if (txItems.length === 1) {
+            const single = txItems[0];
+            const typeLabel = single.transaction_type === 'income' ? '收入' : single.transaction_type === 'transfer' ? '转账' : '支出';
+            replyMsg = `已记录${typeLabel} ¥${single.amount.toFixed(2)} · ${single.category_name} · ${single.account_name}`;
+          } else {
+            const lines = txItems.map((it: import('./types').ParsedTransactionItem, idx: number) => {
+              const tLabel = it.transaction_type === 'income' ? ' [收入]' : it.transaction_type === 'transfer' ? ' [转账]' : '';
+              return `${idx + 1}. ${it.category_name}${tLabel} ¥${it.amount.toFixed(2)} · ${it.account_name}`;
+            });
+            replyMsg = `已记录 ${txItems.length} 笔，共 ¥${totalAmount.toFixed(2)}：\n${lines.join('\n')}`;
+          }
+
+          const responseTransactions = preparedTxs.map((ptx) => ({
+            transaction_id: ptx.id,
+            type: ptx.item.transaction_type,
+            amount: ptx.item.amount,
+            category: ptx.item.category_name,
+            account: ptx.item.account_name,
+            merchant: ptx.item.merchant || null,
+            occurred_at: ptx.item.occurred_at
+          }));
+
+          return jsonResponse({
+            ok: true,
+            message: replyMsg,
+            data: {
+              // Backward compatibility single-item fields
+              transaction_id: firstTx.id,
+              type: firstTx.item.transaction_type,
+              amount: firstTx.item.amount,
+              category: firstTx.item.category_name,
+              account: firstTx.item.account_name,
+              merchant: firstTx.item.merchant || null,
+              occurred_at: firstTx.item.occurred_at,
+              // Full multi-transaction array
+              transactions: responseTransactions
+            }
+          });
+        }
+
+        return jsonResponse({ ok: false, error: 'UNHANDLED_INTENT' }, 400);
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        return jsonResponse({ ok: false, error: 'INTERNAL_ERROR', details: message }, 500);
       }
     }
 
-    return new Response("OK");
-  },
+    // POST /telegram/webhook
+    if (url.pathname === '/telegram/webhook' && method === 'POST') {
+      const secretHeader = request.headers.get('X-Telegram-Bot-Api-Secret-Token');
+      if (!env.TELEGRAM_WEBHOOK_SECRET) {
+        return jsonResponse({ ok: false, error: 'TELEGRAM_WEBHOOK_SECRET_NOT_CONFIGURED' }, 503);
+      }
+      if (secretHeader !== env.TELEGRAM_WEBHOOK_SECRET) {
+        return jsonResponse({ ok: false, error: 'UNAUTHORIZED' }, 401);
+      }
+
+      try {
+        const update = (await request.json()) as TelegramUpdate;
+        const text = update?.message?.text?.trim();
+        const chatId = update?.message?.chat?.id;
+
+        if (!text || !chatId) {
+          return jsonResponse({ ok: true, ignored: true });
+        }
+
+        const referenceTime = resolveTelegramReferenceTime(
+          update.message?.date,
+          env.APP_TIMEZONE || 'Asia/Shanghai'
+        );
+
+        // Delegate to intake handler logic
+        const intakeReq = new Request('https://worker.local/v1/intake', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${getBearerOrSecret(env)}`
+          },
+          body: JSON.stringify({
+            text,
+            source: 'telegram',
+            source_id: `tg_${update.message?.message_id || update.update_id}`,
+            reference_time: referenceTime
+          })
+        });
+
+        const intakeRes = await this.fetch(intakeReq, env);
+        const intakeJson = (await intakeRes.json()) as {
+          ok: boolean;
+          message?: string;
+          error?: string;
+          data?: { transaction_id?: string; transactions?: unknown[]; total?: number };
+        };
+
+        const legacyOperationClass = intakeJson.ok && (intakeJson.data?.transaction_id
+          || (Array.isArray(intakeJson.data?.transactions) && intakeJson.data.transactions.length))
+          ? 'create'
+          : intakeJson.ok && typeof intakeJson.data?.total === 'number'
+            ? 'summarize'
+            : intakeJson.ok
+              ? 'query'
+              : 'error';
+
+        const replyText = intakeJson.message || intakeJson.error || '已处理请求。';
+
+        // Deliver to Telegram if bot token configured
+        if (env.TELEGRAM_BOT_TOKEN) {
+          await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              text: replyText
+            })
+          });
+        }
+
+        return jsonResponse({ ok: true, legacy_operation_class: legacyOperationClass });
+      } catch (err: unknown) {
+        return jsonResponse({ ok: false, error: 'WEBHOOK_PROCESS_FAILED' }, 500);
+      }
+    }
+
+    return jsonResponse({ ok: false, error: 'NOT_FOUND' }, 404);
+  }
 };

@@ -1,0 +1,173 @@
+Finance Command Layer v1 - Isolated E2E Validation Method v2
+
+Why v2 exists
+The previous method attempted local workerd + local D1 + Workers AI remote binding. On this Windows/Wrangler environment, Wrangler 4.129.0 displayed env.AI as remote but actual AI.run calls failed with `Binding AI needs to be run remotely`. Do not spend another pass retrying that binding topology.
+
+Important interpretation of the 2-call failure
+The observed `X-E2E-AI-Calls: 2` does NOT prove a successful Finance Command create uses two AI calls. In the failure case, the command classifier's AI call throws; classifyFinanceCommand catches the error and returns null; src/app.ts then falls through to the legacy paths, which trigger a second AI parse. Therefore the exactly-one-call acceptance must be re-measured on a successful command-layer create, not inferred from the remote-binding failure path.
+
+Goal
+Keep the real Worker entry, real local D1 semantics, real Workers AI model output, and real Telegram-shaped request while bypassing only the broken Wrangler AI remote-binding transport.
+
+Topology
+- src/app.ts executes locally under Wrangler/workerd.
+- D1 is local and isolated under a fresh --persist-to directory.
+- R2/Queue remain local.
+- AI inference is real Cloudflare Workers AI, but transported through a temporary localhost REST bridge instead of env.AI remote binding.
+- The bridge uses the same Cloudflare REST endpoint as tests/real-workers-ai.test.ts.
+- Authentication MUST come from `npx wrangler auth token --json`, not by reading `oauth_token` directly from Wrangler's TOML. Wrangler refreshes expired OAuth credentials when this command is used.
+- No production resource is modified.
+
+Safety
+- Never deploy.
+- Never run production migration.
+- Never use production D1/R2/Queue.
+- Never modify main.
+- Temporary bridge/wrapper/config/SQL must stay untracked and be deleted after testing.
+- Never print or persist the auth token in reports, Git, shell history where avoidable, or test artifacts.
+- The bridge must bind to 127.0.0.1 only.
+
+Step 0 - validate current Cloudflare authentication
+Before creating the bridge:
+1. Run `npx wrangler auth token --json`.
+2. Do NOT print or report the token value. Record only whether a token was returned and the credential type (`oauth` or `api_token`).
+3. Run a one-request Workers AI REST probe using that returned token against the configured account/model.
+4. If the probe succeeds, continue.
+5. If Wrangler reports no usable credentials, run `npx wrangler whoami`. If the session is logged out or OAuth cannot refresh, perform `npx wrangler login` and then repeat steps 1-3.
+6. If credential type is `api_token` and Cloudflare returns authentication/permission error, verify that this API token has Account > Workers AI permissions. Do not broaden permissions beyond what the Workers AI REST call requires.
+7. Do not fall back to reading `oauth_token` directly from `default.toml`; that value can be an expired access token even while Wrangler still has a usable refresh token.
+
+Step 1 - temporary host-side Workers AI REST bridge
+Create an untracked Node script outside the repository or under an ignored temp directory.
+
+The bridge must:
+- listen only on 127.0.0.1 on a dedicated port, e.g. 8792;
+- accept POST /run with JSON `{ model, input }`;
+- obtain the current auth token at bridge startup via `npx wrangler auth token --json`;
+- never read `oauth_token` directly from Wrangler's TOML;
+- use account id `ffda4d04feec5de2ef3fb4fbbe35b496`;
+- forward the request to `https://api.cloudflare.com/client/v4/accounts/<account-id>/ai/run/<model>`;
+- use the same working curl/proxy path (`http://127.0.0.1:7892`) if direct Node fetch is unreliable;
+- return only the Cloudflare `result` on success;
+- return a non-2xx response on Cloudflare API failure;
+- never log the auth token.
+
+First prove the bridge independently with one known real Workers AI command call before starting the Worker.
+
+Step 2 - temporary local Worker wrapper
+Create an untracked local wrapper entry that imports the real `src/app.ts` handler.
+
+For each incoming request:
+- create `aiCallCount = 0`;
+- create an AI shim object with `run(model, input)`;
+- each shim run increments aiCallCount and POSTs `{model,input}` to `http://127.0.0.1:8792/run`;
+- pass a shallow wrapped env to the real app handler: `{ ...env, AI: aiShim }`;
+- do not alter DB, FILES, RECEIPT_QUEUE, time zone, source IDs, or any other binding;
+- return the real app response body/status and add `X-E2E-AI-Calls: <count>`.
+
+This wrapper is test transport only. Do not commit it.
+
+Step 3 - temporary Wrangler config
+Copy wrangler.jsonc to an untracked temporary config.
+- point `main` to the temporary wrapper;
+- keep D1/R2/Queue local;
+- AI binding does not need to be remote because the wrapper replaces env.AI before calling src/app.ts;
+- use a fresh `--persist-to` directory;
+- use a fixed local port, e.g. 8791;
+- configure only a local TELEGRAM_WEBHOOK_SECRET needed for requests.
+
+Do not use `wrangler dev --remote`.
+
+Step 4 - migrations and seed/inspection
+Apply 0001-0007 with Wrangler D1 local commands against the exact same --persist-to directory.
+Use UTF-8 SQL files and Wrangler D1 local execute for seed, inspection, and triggers. Do not use Git Bash sqlite3.
+
+Step 5 - successful one-call create proof
+POST a Telegram-shaped update containing `午饭25元` to the local `/telegram/webhook`.
+Require simultaneously:
+- HTTP success;
+- response indicates finance_command action create;
+- `X-E2E-AI-Calls = 1`;
+- exactly one D1 transaction exists for the message;
+- amount_fen=2500;
+- source=telegram;
+- source_id=tg_<message_id>;
+- raw_text exactly equals the original Chinese input;
+- occurred_at equals the timestamp derived from Telegram update.message.date.
+
+If this successful request reports two AI calls, then it is a real product failure and must be returned to ChatGPT for a code fix.
+
+Step 6 - multi create and idempotency
+Send `一盒硬白沙烟10元，一提维达抽纸18.9`.
+Require:
+- successful command-layer create;
+- X-E2E-AI-Calls=1;
+- two D1 rows only;
+- amounts 1000/1890 fen;
+- categories 烟酒/日用品;
+- source ids tg_<message_id> and tg_<message_id>#2;
+- both raw_text fields equal the full original input;
+- both occurred_at values use Telegram event time.
+
+Send the exact same Telegram update a second time.
+Require active transaction count and IDs unchanged.
+
+Step 7 - update lifecycle
+Create/seed a 38 yuan target, preserve its complete pre-state, then send `刚才金额不是38，是28` through the real local Telegram endpoint.
+Require same transaction ID, 3800->2800 only, applied ledger_operations update, complete before_json and after_json.
+
+Separately verify `刚才那笔改成支付宝` changes only account-related state and preserves unrelated fields.
+
+Step 8 - delete/restore lifecycle
+Create two latest rows and preserve full snapshots.
+Send `把刚才两笔删掉`.
+Require both absent and one applied delete operation containing both complete snapshots.
+
+Then restore them through Telegram language.
+Require original IDs and exact restoration of amount/category/account/source/source_id/raw_text/occurred_at/created_at/updated_at plus applied restore audit.
+
+Step 9 - receipt transaction_items
+Seed one receipt parent plus at least two transaction_items using Wrangler D1 local UTF-8 SQL.
+Delete through the command layer and restore through the command layer.
+Require exact parent and item restoration, including all item IDs and fields.
+
+Step 10 - ambiguity protection
+Seed at least two rows matching the same non-unique filter.
+Test both update and delete without explicit count or unique detail.
+Require refusal/narrowing reply, zero mutation, and no applied mutation audit.
+
+Step 11 - four atomic failure injections
+Use temporary local D1 SQLite triggers via Wrangler D1 local execute, one case at a time, and remove each trigger after its case.
+
+A. Abort second multi-create INSERT by source_id suffix #2. Require zero rows from the message.
+B. Abort second target UPDATE. Require both rows unchanged and no applied update audit.
+C. Abort second target DELETE. Require both rows remain and no applied delete audit.
+D. After successful receipt delete, abort second transaction_items INSERT during restore. Require parent absent, zero partial items, no applied restore audit.
+
+A failed statement in a D1 batch is expected to roll the batch back; capture actual D1 evidence for each case.
+
+Step 12 - legacy and query regression via real local Worker entry
+Run at minimum:
+- 本月花了多少
+- 本月支出明细
+- 哪些部分花得多
+- 跟上个月比
+- 找一下昨天买烟的记录
+- 刚才两笔一共多少
+
+Require legacy/conversation paths remain reachable for passthrough inputs and command query/summarize paths still work.
+Retain the existing proofs:
+- 101 matching summarize rows => exact 101 and exact amount;
+- >10 query rows => explicit truncation message and only first 10 displayed.
+
+Step 13 - interpretation of AI transport
+This v2 test deliberately separates two concerns:
+1. Real model correctness: proven separately with direct Cloudflare Workers AI REST calls and the required 10-input matrix.
+2. Real Worker/D1 integration correctness: proven here using the same real model over a localhost REST transport shim.
+
+Do not fail the product merely because Wrangler's AI remote-binding transport is broken on this machine if both layers above pass independently and together through the shim.
+
+Final PASS gate
+Overall PASS only if all lifecycle, transaction_items, ambiguity, idempotency, exactly-one-AI-call on successful create, four atomic rollback cases, query/summarize, and legacy regression checks have concrete local Worker + local D1 evidence, while the direct real-model matrix remains 10/10.
+
+Production must remain untouched throughout.
