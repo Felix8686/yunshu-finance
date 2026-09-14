@@ -1,128 +1,75 @@
-# 云枢 v0.1 架构
+# Wanxiang Cloud v0.1 Architecture
 
-## 目标
+## Goal
 
-云枢是个人财务记录与回顾系统，不是通用 Agent 平台。
+先跑通一条最小但真实的云端闭环：电脑关机时，Telegram 仍可把自然语言收支写入 Cloudflare D1，并查询当天支出。
 
-它要可靠完成两件事：
+## Runtime ownership
 
-1. 把自然语言变成结构化财务指令。
-2. 用确定性代码把这些指令落到真实数据库并返回结果。
+- Cloudflare = 主运行环境与主数据源。
+- D1 = 结构化主库。
+- Workers AI = 云端自然语言理解层。
+- Worker = 唯一业务规则与数据库写入层。
+- Telegram = 第一版远程入口。
+- Obsidian / Hermes = 后续本地工作副本与轻量执行端，不是云端系统宿主。
 
-## 唯一主链路
+## Request flow
 
 ```text
-Telegram
-  -> Cloudflare Worker
-  -> DeepSeek API
-  -> FinanceCommand JSON
-  -> 参数校验
-  -> 固定代码执行 D1
-  -> 确定性结果
-  -> Telegram
+Telegram message
+  -> /telegram/webhook
+  -> webhook secret verification
+  -> Workers AI structured parsing
+  -> Worker validation + allowlist rules
+  -> D1 transaction/query
+  -> Telegram reply
 ```
 
-## 五条架构铁律
+Generic API:
 
-1. DeepSeek 是唯一自然语言理解权威。
-   后端不写关键词路由、不写正则意图识别、不维护第二套 parser。
+```text
+POST /v1/intake
+  -> Bearer API key
+  -> same parse/validate/write pipeline
+```
 
-2. 代码是唯一执行权威。
-   DeepSeek 只能输出固定 FinanceCommand，不能直接执行数据库操作。
+## Safety boundary
 
-3. D1 是唯一财务事实来源。
-   模型不能自己计算或记忆“真实账目”。所有统计必须来自 D1 查询结果。
+AI never receives direct D1 authority. It only returns a structured proposal:
 
-4. 模型永远不能生成可执行 SQL。
-   SQL 模板固定在代码中，用户输入只能变成绑定参数。
+- intent
+- transaction type
+- amount
+- category
+- account
+- description
+- occurred_at
+- confidence
 
-5. 不建立 fallback 意图链。
-   DeepSeek 输出无效结构时直接失败并提示重试；不得偷偷切到另一套语义判断逻辑。
+Worker code validates that proposal before any write. Low-confidence or invalid input results in no database mutation.
 
-## v0.1 指令协议
+## D1 tables
 
-### create
+- `accounts`: payment/account sources.
+- `categories`: controlled transaction categories.
+- `transactions`: financial ledger; money is stored as integer fen.
+- `events`: reserved for later life-management reminders/events.
+- `ingestion_log`: deduplication and intake audit trail.
 
-新增一笔或多笔收入/支出。
+## v0.1 supported intents
 
-模型负责：
-- 拆分多笔交易
-- 理解金额
-- 理解相对日期
-- 统一分类
-- 识别账户
+1. Create a transaction, for example: `晚饭25元`.
+2. Query today's spending, for example: `今天花了多少钱`.
+3. Unknown/low-confidence input: do nothing and ask the user to rephrase.
 
-代码负责：
-- 校验字段
-- 防重复
-- D1 batch 写入
+## Not in v0.1
 
-### report
+- R2 attachments/Markdown storage.
+- Obsidian synchronization.
+- Historical ledger import.
+- Cron reminders.
+- Queues.
+- General life-management event creation.
+- Production environment.
 
-所有查账都归为一个动作，通过 `report_type` 区分：
-
-- `summary`：总账、总收入、总支出、结余
-- `details`：账单、明细
-- `category_breakdown`：分类构成
-- `compare`：两个时间段比较
-
-周、月、季度、年度没有各自独立代码路径；模型统一转换成绝对 `start_date/end_date`，后端只认识日期范围。
-
-### undo
-
-撤销当前 Telegram 用户最近一次记账消息对应的整个 transaction group。
-
-### clarify
-
-只有缺少必要信息时使用，例如记账没有金额。
-
-### help
-
-非财务请求或能力说明。
-
-## 数据模型
-
-v0.1 只使用一张核心表 `transactions`。
-
-重要字段：
-
-- `type`
-- `amount_fen`
-- `category`
-- `description`
-- `account`
-- `occurred_at`
-- Telegram 来源字段
-- `raw_text`
-
-金额统一使用整数分，避免浮点误差。
-
-## 为什么不做更多层
-
-不引入：
-
-- Orchestrator
-- 多级 Router
-- Intent Parser
-- Planner
-- Agent memory
-- 多 Provider fallback
-- 模型生成 SQL
-- 关键词兼容层
-
-需要增加功能时，优先扩充 `FinanceCommand` 协议和固定执行器，而不是增加新的语义入口。
-
-## v0.1 验收核心语句
-
-以下必须在真实 Telegram + DeepSeek + D1 环境连续通过：
-
-- `午饭18，支付宝`
-- `一盒烟15，一个打火机3块，现金`
-- `上个月的账单`
-- `这个月总共花了多少`
-- `看看本周各类花费`
-- `第二季度总账`
-- `第二季度和第一季度比一下`
-- `撤销刚才那次记账`
-
-只有这一组核心闭环稳定后，才允许增加 OCR、复杂修改、图表或其他外围能力。
+These are intentionally deferred until the first cloud ledger loop passes real-device validation.

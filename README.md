@@ -1,37 +1,27 @@
-# 云枢
+# Wanxiang Cloud
 
-AI 驱动的个人财务记录与回顾系统。
+Cloudflare-first 的个人万象库云端化项目。
 
-## v0.1 目标
+## Status
 
-云枢只做一条简单链路：
+**Active development**
 
-`Telegram -> DeepSeek -> 结构化财务指令 -> Cloudflare Worker -> D1 -> Telegram`
+当前目标是把原本依赖本机 Obsidian / Hermes 环境的部分能力逐步迁移到云端，使记账、生活管理、数据查询和后续 Agent 自动化在电脑关机时仍可运行。
 
-DeepSeek 是唯一自然语言理解入口；后端不做关键词猜测、不建立第二套意图解析器、不允许模型直接执行 SQL。
+## Direction
 
-v0.1 支持：
+- Cloudflare 优先部署；
+- 本地 Obsidian 保留为可读、可编辑的个人知识入口；
+- 云端作为持续在线的数据与自动化层；
+- 后续 AI 管理能力优先部署在云端；
+- 必须访问本机资源的能力采用“云端主控 + 本地轻量执行端”。
 
-- 自然语言记账，可一次输入多笔
-- 自然语言查账
-- 周 / 月 / 季度 / 年度及任意日期范围汇总
-- 分类支出统计
-- 两个时间段对比
-- 撤销最近一次记账
+## Planned stack
 
-## 技术栈
-
-- Telegram Bot
 - Cloudflare Workers
-- Cloudflare D1
-- DeepSeek API
+- D1
+- R2
+- Queues
+- Cron Triggers
 
-## 开发规则
-
-- `main` 只保存已验收版本
-- 当前开发分支：`dev/v0.1`
-- Secret 不进入 Git
-- 所有金额以整数分 `amount_fen` 保存
-- D1 是财务事实唯一来源
-
-详细设计见 `docs/ARCHITECTURE.md`。
+Finance Orchestrator V2 已进入隔离工作树实现验证阶段：本地协议、D1 迁移、统一执行核心、ResultSet/分页、Outbox、receipt V3 和 runtime route fence 已接入；生产迁移、部署、Telegram 真实账号 E2E 和全量 cutover 仍需按实现运行手册逐项验收。

@@ -1,0 +1,135 @@
+Finance Command Layer v1 - Isolated E2E Validation Method
+
+Purpose
+This document resolves the remaining validation gap without touching production and without relying on Git Bash sqlite3.
+
+Principle
+Run the real Worker entry locally under workerd/Miniflare, keep D1 local and isolated, but use the real Workers AI binding remotely. Use Wrangler D1 commands for all seed/inspection/fault-injection SQL. Do not use sqlite3.exe.
+
+Cloudflare supports this topology:
+- Worker code executes locally under wrangler dev/workerd.
+- D1 remains a local simulated binding unless remote=true is set.
+- Workers AI has no local simulation and should use a remote binding.
+
+Safety rules
+- Never use wrangler dev --remote.
+- Never set D1 remote=true.
+- Never run d1 execute/migrations with --remote.
+- Never deploy.
+- Never modify main.
+- Use a fresh isolated persistence directory.
+- Any temporary Wrangler config/wrapper must remain untracked and be deleted when done.
+
+Recommended local topology
+1. Create a temporary Wrangler config copied from wrangler.jsonc.
+2. Keep main = src/app.ts unless using the temporary AI-count wrapper described below.
+3. Set only the AI binding to remote=true.
+4. Keep D1/R2/Queue local.
+5. Start wrangler dev with a dedicated --persist-to directory and fixed port.
+6. Apply migrations 0001-0007 to that same local persistence directory.
+7. Use PowerShell and UTF-8 .sql files with `wrangler d1 execute --local --persist-to ... --file ...` for all seed/check/fault-injection work.
+
+Exactly-one-AI-call instrumentation
+Do not change production source for this measurement. Create a temporary untracked local entry wrapper that imports src/app.ts, wraps env.AI.run with a counter, calls the real app.fetch, and adds the final count to an HTTP response header such as X-E2E-AI-Calls. The wrapper must delegate every actual inference to the original remote Workers AI binding. Point only the temporary Wrangler config's main field at this wrapper. Remove it after validation.
+
+For a fresh Telegram create update, require:
+- response is finance_command/create;
+- X-E2E-AI-Calls = 1;
+- local D1 contains the expected transaction(s).
+
+Telegram-equivalent entry
+POST real Telegram-shaped updates to the local /telegram/webhook endpoint with a local TELEGRAM_WEBHOOK_SECRET. A real bot token is not required for ledger verification; Telegram send failure is caught by sendTelegramMessageSafely and must not affect the local ledger assertions.
+
+Create verification
+Single create: `午饭25元`
+- exactly 1 row
+- amount_fen = 2500
+- source = telegram
+- source_id = tg_<message_id>
+- raw_text exactly equals the complete input
+- occurred_at equals the Telegram event-time-derived local timestamp
+
+Multi create: `一盒硬白沙烟10元，一提维达抽纸18.9`
+- exactly 2 rows
+- amount_fen values 1000 and 1890
+- category names 烟酒 and 日用品
+- source ids tg_<message_id> and tg_<message_id>#2
+- both raw_text values equal the complete original input
+- both occurred_at values reflect Telegram event time
+
+Duplicate delivery
+Send the exact same Telegram update twice.
+Require transaction count and IDs after the second delivery to be unchanged. No duplicate active ledger rows may exist.
+
+Update lifecycle
+Seed/create a 38 yuan target, record its id and complete row.
+Send `刚才金额不是38，是28` through /telegram/webhook.
+Require:
+- same transaction id
+- amount_fen 3800 -> 2800 only
+- ledger_operations contains one applied update
+- before_json preserves complete old transaction snapshot
+- after_json preserves complete new transaction snapshot
+
+Separately verify `刚才那笔改成支付宝` changes only account_id/account_name while preserving transaction id and all unrelated fields.
+
+Delete lifecycle
+Create two known latest rows, record their IDs and full snapshots.
+Send `把刚才两笔删掉`.
+Require both active rows absent and one applied delete operation whose before_json contains both complete snapshots.
+
+Restore lifecycle
+After the preceding delete, send the matching restore language.
+Require restored rows use the original transaction IDs and exactly restore amount/category/account/source/source_id/raw_text/occurred_at/created_at/updated_at from the saved snapshot. Require an applied restore ledger operation.
+
+Receipt transaction_items delete/restore
+Seed one latest receipt-style parent transaction plus at least two transaction_items using Wrangler D1 local execute and UTF-8 SQL. Delete it through the Telegram command layer, then restore it.
+Require parent and every item id/transaction_id/name/quantity/unit_price_fen/line_total_fen/category/confidence/created_at to match the pre-delete snapshot exactly.
+
+Ambiguity guard
+Seed at least two active rows that intentionally match the same natural-language filter.
+Exercise both update and delete commands without an explicit count or unique identifying detail.
+Require:
+- Bot/HTTP path returns narrowing/refusal text
+- 0 rows deleted
+- 0 rows updated
+- no applied mutation ledger operation created
+
+Atomic failure injection
+Use local D1 SQLite triggers created only in the isolated database. Remove each trigger after its case. D1 batch is expected to roll back the complete batch when any statement fails.
+
+A. create second INSERT failure
+Create BEFORE INSERT trigger on transactions that RAISE(ABORT, ...) only when NEW.source_id equals the expected second multi-create source id suffix (#2).
+Send a two-item create.
+Require HTTP failure and 0 rows from that message source. First insert must also be rolled back.
+
+B. update middle failure
+Seed two target rows. Create BEFORE UPDATE trigger that aborts only for the second target ID. Send an explicit two-row update command.
+Require both original rows unchanged and no applied update ledger operation.
+
+C. delete middle failure
+Seed two target rows. Create BEFORE DELETE trigger that aborts only for the second target ID. Send an explicit two-row delete command.
+Require both rows remain and no applied delete ledger operation.
+
+D. restore transaction_items middle failure
+Create a receipt parent with at least two items, delete it successfully so snapshot exists, then create BEFORE INSERT trigger on transaction_items that aborts on the second item ID. Send restore.
+Require parent remains absent, no item is partially restored, and no applied restore operation is committed.
+
+All fault-injection SQL must be executed through Wrangler D1 local commands against the same --persist-to directory as the running local Worker.
+
+Query/summarize regression
+- Keep existing 101-row aggregate proof: exact 101 count and total.
+- Keep >10 detail proof: explicitly reports truncation and displays only first 10.
+
+Passthrough/legacy regression via real local Worker entry
+Exercise at minimum:
+- 本月花了多少
+- 本月支出明细
+- 哪些部分花得多
+- 跟上个月比
+Also exercise the handoff's query/summarize examples through /telegram/webhook.
+Require legacy finance conversation/query behavior remains reachable when command layer returns passthrough.
+
+Final gates
+Overall PASS is allowed only when every lifecycle, ambiguity, idempotency, AI-call-count, transaction_items and four atomic-failure assertions above has concrete output plus local D1 evidence.
+Production must remain completely untouched.
