@@ -1,5 +1,5 @@
 {
-  "name": "wanxiang-cloud",
+  "name": "yunshu-finance",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -19,8 +19,8 @@
     "test:finance-conversation": "tsx tests/finance-conversation.test.ts",
     "test:intake-fidelity": "tsx tests/intake-fidelity.test.ts",
     "finance:recovery:plan": "tsx scripts/generate-finance-fidelity-recovery.ts",
-    "db:migrate:local": "wrangler d1 migrations apply wanxiang-cloud-dev --local",
-    "db:migrate:remote": "wrangler d1 migrations apply wanxiang-cloud-dev --remote"
+    "db:migrate:local": "wrangler d1 migrations apply yunshu-finance-prod --local",
+    "db:migrate:remote": "wrangler d1 migrations apply yunshu-finance-prod --remote"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260902.1",
