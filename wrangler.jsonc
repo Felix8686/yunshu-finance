@@ -17,13 +17,13 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "yunshu-finance-prod",
+      "database_name": "wanxiang-cloud-dev",
       "database_id": "67f7c38b-2def-4092-ae8a-e6bdfcd55cc3",
       "migrations_dir": "migrations"
     },
     {
       "binding": "SHADOW_DB",
-      "database_name": "yunshu-finance-prod-shadow",
+      "database_name": "wanxiang-cloud-dev-shadow",
       "database_id": "a69881f7-7574-402f-ae14-743d42f1464b",
       "migrations_dir": "shadow-migrations"
     }
