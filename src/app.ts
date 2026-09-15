@@ -286,6 +286,20 @@ export default {
           telegramThreadId: update.message?.message_thread_id ? String(update.message.message_thread_id) : null
         });
         await enqueueFinanceOutboxDispatch(env);
+        if (response.in_progress) {
+          console.info('telegram finance v2 duplicate in-progress acknowledged', JSON.stringify({
+            turn_id: turn.turn_id,
+            operation_id: response.operation_id || null
+          }));
+          return jsonResponse({
+            ok: true,
+            finance_v2: true,
+            operation_id: response.operation_id,
+            duplicate: true,
+            in_progress: true,
+            acknowledged: true
+          }, 200);
+        }
         const isError = response.result.kind !== 'success';
         if (isError && response.render_payload && response.delivery_queued !== true) {
           for (const part of response.render_payload.telegram_parts) {
@@ -299,7 +313,7 @@ export default {
           duplicate: response.duplicate || false,
           in_progress: response.in_progress || false,
           result: response.result
-        }, response.in_progress ? 409 : 200);
+        }, 200);
       } catch (error) {
         console.error('telegram finance v2 failed', error instanceof Error ? error.message : 'unknown error');
         return jsonResponse({ ok: false, finance_v2: true, error: 'FINANCE_V2_FAILED' }, 500);
